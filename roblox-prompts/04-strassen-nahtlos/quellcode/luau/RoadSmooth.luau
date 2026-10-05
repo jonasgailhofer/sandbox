@@ -18,6 +18,7 @@ local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local StarterPlayer = game:GetService("StarterPlayer")
+local ScriptEditorService = game:GetService("ScriptEditorService")
 
 local Core = require(script:WaitForChild("Core"))
 RS.Core = Core
@@ -34,7 +35,7 @@ RS.ROADNAMES = {
 -- Ordner, deren Inhalt nie Fahrbahn ist (auch wenn Teile dort so heissen)
 RS.EXCLUDE = {
 	CaseScenes = true, Plots = true, FahrHaut = true, StrassenMesh = true, StrassenMesh2 = true, Landschaft = true,
-	Fleet = true, Decor = true, Trading = true, Hub = true, Staging = true,
+	Fleet = true, Decor = true, Trading = true, Hub = true, Staging = true, Ausflugsschiff = true, Containerschiff = true,
 }
 RS.GROUP_BASE, RS.GROUP_SKIN, RS.GROUP_RAY = "RoadBase", "RoadSkin", "TruckRay"
 RS.UNDER = 3 -- Teil liegt unter einer anderen Fahrbahn (Unterfuehrung), wenn diese mehr als so hoch darueber liegt
@@ -65,6 +66,14 @@ local function excluded(p)
 	end
 	return false
 end
+
+-- Fahrbahnteil? ("Deck" nur bei Bruecken, nicht bei Schiffen/Buehnen)
+local function isRoad(p)
+	if not RS.ROADNAMES[p.Name] then return false end
+	if p.Name == "Deck" and not p:FindFirstAncestor("Bridges") then return false end
+	return true
+end
+RS.IsRoad = isRoad
 
 local function folder(parent, name)
 	local f = parent:FindFirstChild(name)
@@ -102,6 +111,8 @@ function RS.PartInfo(p)
 			k = 2
 		elseif p.Shape == Enum.PartType.Ball then
 			k = 3
+		elseif p.Shape == Enum.PartType.Wedge then
+			k = 1
 		end
 	end
 	return { k = k, x = x, y = y, z = z, r = { r00, r01, r02, r10, r11, r12, r20, r21, r22 }, sx = p.Size.X, sy = p.Size.Y, sz = p.Size.Z }
@@ -115,7 +126,14 @@ function RS.Groups()
 	-- Fahrwerks-Strahlen sehen die alten Abschnitte nicht mehr, nur die Haut (und alles andere wie bisher)
 	PhysicsService:CollisionGroupSetCollidable(RS.GROUP_RAY, RS.GROUP_BASE, false)
 	PhysicsService:CollisionGroupSetCollidable(RS.GROUP_RAY, RS.GROUP_SKIN, true)
-	return "Gruppen bereit: RoadBase (alte Fahrbahn), RoadSkin (Haut), TruckRay (Fahrwerks-Strahlen, ignoriert RoadBase)"
+	-- die Haut existiert fuer alles andere nicht (Figuren, Kasten, andere Raycasts, Overlaps)
+	for _, info in ipairs(PhysicsService:GetRegisteredCollisionGroups()) do
+		local name = info.name
+		if name ~= RS.GROUP_RAY and name ~= RS.GROUP_SKIN then
+			PhysicsService:CollisionGroupSetCollidable(RS.GROUP_SKIN, name, false)
+		end
+	end
+	return "Gruppen bereit: RoadBase (alte Fahrbahn), RoadSkin (Haut, nur fuer TruckRay sichtbar), TruckRay (Fahrwerks-Strahlen, ignoriert RoadBase)"
 end
 
 ----------------------------------------------------------------------------------------------- Sammeln
@@ -125,14 +143,15 @@ function RS.Collect(city)
 	assert(W, "workspace.World fehlt")
 	local out = {}
 	for _, p in ipairs(W:GetDescendants()) do
-		if p:IsA("BasePart") and RS.ROADNAMES[p.Name] and p.CanCollide and not p:IsA("MeshPart") and not p:IsA("UnionOperation") then
+		if p:IsA("BasePart") and isRoad(p) and p.CanCollide and not p:IsA("MeshPart") and not p:IsA("UnionOperation") then
 			if cityOfX(p.Position.X) == city and not excluded(p) then table.insert(out, p) end
 		end
 	end
 	return out
 end
 
--- Teile, die unter einer anderen Fahrbahn liegen (Unterfuehrung): bleiben unveraendert
+-- Teile, die (auch nur teilweise) unter einer anderen Fahrbahn liegen (Unterfuehrung): bleiben unveraendert
+-- (keine Haut, Gruppe bleibt, Optik bleibt sichtbar). Dichte Abtastung der Oberseite (alle 2 Studs).
 function RS.Under(parts)
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Include
@@ -141,31 +160,16 @@ function RS.Under(parts)
 	for i, p in ipairs(parts) do
 		local info = RS.PartInfo(p)
 		local nx, ny, nz, ft = Core.TopFace(info)
-		local hits = 0
-		for _, o in ipairs({ { 0, 0 }, { 0.3, 0.3 }, { -0.3, 0.3 }, { 0.3, -0.3 }, { -0.3, -0.3 } }) do
-			-- Punkt auf der Oberseite (grob): Mitte + Versatz in den beiden anderen Achsen
-			local loc
-			if ft == "disc" or ft == "tri" then
-				loc = Vector3.new(nx * p.Size.X / 2, o[1] * p.Size.Y, o[2] * p.Size.Z)
-			elseif ft == "slope" then
-				local lz = o[2] * p.Size.Z
-				loc = Vector3.new(o[1] * p.Size.X, -p.Size.Y / 2 + (lz / p.Size.Z + 0.5) * p.Size.Y, lz)
-			else
-				local a = (math.abs(nx) > 0.5) and 1 or ((math.abs(ny) > 0.5) and 2 or 3)
-				local v = { 0, 0, 0 }
-				local s = { p.Size.X, p.Size.Y, p.Size.Z }
-				v[a] = ({ nx, ny, nz })[a] * s[a] / 2
-				local u1, u2 = (a == 1) and 2 or 1, (a == 3) and 2 or 3
-				v[u1] = o[1] * s[u1]
-				v[u2] = o[2] * s[u2]
-				loc = Vector3.new(v[1], v[2], v[3])
-			end
-			local wp = p.CFrame:PointToWorldSpace(loc)
+		local loc = Core.FaceSamples(info.k, nx, ny, nz, ft, info.sx, info.sy, info.sz, 2)
+		for _, q in ipairs(loc) do
+			local wp = p.CFrame:PointToWorldSpace(Vector3.new(q[1], q[2], q[3]))
 			local r = Workspace:Raycast(wp + Vector3.new(0, 0.05, 0), Vector3.new(0, 80, 0), rp)
-			if r and r.Instance ~= p and r.Distance > RS.UNDER then hits += 1 end
+			if r and r.Instance ~= p and r.Distance > RS.UNDER then
+				under[p] = true
+				break
+			end
 		end
-		if hits >= 3 then under[p] = true end
-		if i % 300 == 0 then yield() end
+		if i % 100 == 0 then yield() end
 	end
 	return under
 end
@@ -182,8 +186,10 @@ local function skinFolder(city, create)
 	end
 	local f = root:FindFirstChild(city)
 	if not f and create then
-		f = Instance.new("Folder")
+		-- Persistent: die Haut ist auf jedem Client immer vollstaendig da (kein Streaming-Loch unter dem LKW)
+		f = Instance.new("Model")
 		f.Name = city
+		f.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
 		f.Parent = root
 	end
 	return f
@@ -260,10 +266,12 @@ function RS.Build(city, opts)
 		if id ~= 0 then owners[id] = true end
 	end
 	local pieces, stat = {}, {}
+	local partial = {} -- teilweise verdeckt: bleiben fuer die Fahrwerks-Strahlen sichtbar
 	for i, info in ipairs(infos) do
 		if owners[i] then
 			local pc, st = Core.PiecesFor(g, info)
 			stat[st] = (stat[st] or 0) + 1
+			if st == "unter" then partial[list[i]] = true end
 			for _, q in ipairs(pc) do table.insert(pieces, q) end
 		end
 		if i % 100 == 0 then yield(0.6 + 0.15 * i / #infos) end
@@ -285,10 +293,10 @@ function RS.Build(city, opts)
 	end
 	table.sort(dev)
 	local function pct(q) return dev[math.max(1, math.floor(#dev * q))] or 0 end
+	local function count(t) local n = 0 for _ in pairs(t) do n += 1 end return n end
 	local summary = string.format(
-		"%s: %d Fahrbahnteile (%d Unterfuehrung, %d oben), %d Hautplatten (%d Luecken), geteilt %d, Haut-alt: 1%% %.2f / 50%% %.2f / 99%% %.2f, Stellen >0.3: %d",
-		city, #list + (function() local n = 0 for _ in pairs(under) do n += 1 end return n end)(), (function() local n = 0 for _ in pairs(under) do n += 1 end return n end)(),
-		(function() local n = 0 for _ in pairs(owners) do n += 1 end return n end)(), #pieces, #gaps, stat["geteilt"] or 0, pct(0.01), pct(0.5), pct(0.99), #big)
+		"%s: %d Fahrbahnteile (%d Unterfuehrung, %d teilweise verdeckt, %d oben), %d Hautplatten (%d Luecken), geteilt %d, Haut-alt: 1%% %.2f / 50%% %.2f / 99%% %.2f, Stellen >0.3: %d",
+		city, #list + count(under), count(under), count(partial), count(owners), #pieces, #gaps, stat["geteilt"] or 0, pct(0.01), pct(0.5), pct(0.99), #big)
 	if opts.Dry then
 		setStep("fertig (Probe)", 1)
 		return summary
@@ -302,10 +310,49 @@ function RS.Build(city, opts)
 		makePart(pc).Parent = f
 		if i % 200 == 0 then yield(0.75 + 0.2 * i / #pieces) end
 	end
-	-- alte Fahrbahn fuer die Fahrwerks-Strahlen ausblenden (Gruppe RoadBase), Unterfuehrungen bleiben Default
+	-- alte Fahrbahn fuer die Fahrwerks-Strahlen ausblenden (Gruppe RoadBase) - aber nur, wo die Haut sie wirklich abdeckt.
+	-- Unterfuehrungen, teilweise verdeckte und nicht abgedeckte Teile bleiben in ihrer Gruppe.
 	setStep("Gruppen setzen", 0.95)
+	local skinRp = RaycastParams.new()
+	skinRp.FilterType = Enum.RaycastFilterType.Include
+	skinRp.FilterDescendantsInstances = { f }
+	skinRp.CollisionGroup = RS.GROUP_RAY -- die Haut ist nur fuer TruckRay sichtbar
+	local toBase = {}
+	local notCovered = 0
+	for idx, p in ipairs(list) do
+		if not partial[p] then
+			local info = infos[idx]
+			local nx, ny, nz, ft = Core.TopFace(info)
+			local loc = Core.FaceSamples(info.k, nx, ny, nz, ft, info.sx, info.sy, info.sz, 2)
+			local hit, tot = 0, 0
+			for _, q in ipairs(loc) do
+				local wp = p.CFrame:PointToWorldSpace(Vector3.new(q[1], q[2], q[3]))
+				tot += 1
+				local r = Workspace:Raycast(wp + Vector3.new(0, 3, 0), Vector3.new(0, -6, 0), skinRp)
+				if r then hit += 1 end
+			end
+			if tot > 0 and hit >= 0.9 * tot then
+				toBase[p] = true
+			else
+				notCovered += 1
+			end
+		end
+		if idx % 100 == 0 then yield(0.95 + 0.04 * idx / #list) end
+	end
+	-- fruehere RoadBase-Teile dieser Stadt, die jetzt nicht mehr dazugehoeren, zuruecksetzen
+	local nBack = 0
+	for _, p in ipairs(world():GetDescendants()) do
+		if p:IsA("BasePart") and not toBase[p] then
+			local og = p:GetAttribute("RS_Group")
+			if og ~= nil and cityOfX(p.Position.X) == city then
+				p.CollisionGroup = og
+				p:SetAttribute("RS_Group", nil)
+				nBack += 1
+			end
+		end
+	end
 	local n = 0
-	for _, p in ipairs(list) do
+	for p in pairs(toBase) do
 		if p:GetAttribute("RS_Group") == nil then p:SetAttribute("RS_Group", p.CollisionGroup) end
 		p.CollisionGroup = RS.GROUP_BASE
 		n += 1
@@ -322,7 +369,7 @@ function RS.Build(city, opts)
 	sv.Value = string.sub(bigJson, 1, 190000)
 	sv.Parent = rep
 	setStep("fertig", 1)
-	return summary .. string.format(" | %d Teile -> RoadBase | %.1fs", n, os.clock() - t0)
+	return summary .. string.format(" | %d Teile -> RoadBase, %d nicht voll abgedeckt (bleiben sichtbar fuer das Fahrwerk), %d zurueckgesetzt | %.1fs", n, notCovered, nBack, os.clock() - t0)
 end
 
 -- Haut entfernen, Gruppen der alten Fahrbahn zuruecksetzen
@@ -351,27 +398,50 @@ local function truckScript()
 	return client and client:FindFirstChild("Truck")
 end
 
+-- Quelltext setzen: ueber ScriptEditorService (funktioniert auch bei offenem Skript-Tab / Collaborative Editing),
+-- sonst direkt .Source
+local function setSource(sc, text)
+	local ok = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(sc, function() return text end)
+	end)
+	if not ok or sc.Source ~= text then sc.Source = text end
+	return sc.Source == text
+end
+
 function RS.InstallTruck()
 	local tr = truckScript()
 	assert(tr and tr:IsA("ModuleScript"), "StarterPlayerScripts.Client.Truck nicht gefunden")
 	local src = script:WaitForChild("TruckNeu")
+	if tr.Source == src.Source then
+		RS.Groups()
+		return "Fahrwerk v2 ist schon installiert"
+	end
 	local bk = folder(ServerStorage, "ScriptBackups")
-	if not bk:FindFirstChild("Truck_vorRoadSmooth") then
+	local old = bk:FindFirstChild("Truck_vorRoadSmooth")
+	if old and old.Source ~= tr.Source then
+		-- Truck wurde seit dem letzten Backup geaendert: altes Backup behalten (mit Datum), aktuellen Stand sichern
+		old.Name = "Truck_vorRoadSmooth_" .. os.date("%Y%m%d_%H%M%S")
+		old = nil
+	end
+	if not old then
 		local c = tr:Clone()
 		c.Name = "Truck_vorRoadSmooth"
 		c.Parent = bk
 	end
-	tr.Source = src.Source
+	assert(setSource(tr, src.Source), "Quelltext liess sich nicht setzen - Truck-Skript-Tab schliessen und nochmal")
 	RS.Groups()
 	return "Fahrwerk v2 installiert (Backup: ServerStorage.ScriptBackups.Truck_vorRoadSmooth)"
 end
 
-function RS.UninstallTruck()
+function RS.UninstallTruck(force)
 	local tr = truckScript()
 	local bk = ServerStorage:FindFirstChild("ScriptBackups")
 	local old = bk and bk:FindFirstChild("Truck_vorRoadSmooth")
 	assert(tr and old, "Backup oder Truck-Modul fehlt")
-	tr.Source = old.Source
+	local src = script:FindFirstChild("TruckNeu")
+	assert(force or (src and tr.Source == src.Source),
+		"Truck-Modul wurde nach der Installation geaendert - RS.UninstallTruck(true) setzt trotzdem das Backup zurueck")
+	assert(setSource(tr, old.Source), "Quelltext liess sich nicht setzen - Truck-Skript-Tab schliessen und nochmal")
 	return "altes Fahrwerk wiederhergestellt"
 end
 
@@ -391,6 +461,11 @@ local function rayParams(mode)
 			if m then table.insert(ex, m) end
 		end
 	end
+	if mode == "alt" then
+		-- Ausgangslage wie vor dem Bau: die Haut gibt es fuer diese Strahlen nicht
+		local fh = world() and world():FindFirstChild("FahrHaut")
+		if fh then table.insert(ex, fh) end
+	end
 	rp.FilterDescendantsInstances = ex
 	if mode ~= "alt" then
 		rp.RespectCanCollide = true
@@ -400,10 +475,13 @@ local function rayParams(mode)
 end
 
 -- Fahrlinien: Mittellinie jedes Fahrbahn-Blocks entlang lokal Z (+1.5 Studs ueber die Enden) und NavData-Linien
+local LINE_NAMES = { Road = true, Lane = true, Asphalt = true, RoadRamp = true, Deck = true, Track = true, Yard = true }
 local function drivingLines(city, sample)
 	local lines = {}
 	for _, p in ipairs(RS.Collect(city)) do
-		if p:IsA("Part") and p.Shape == Enum.PartType.Block and math.abs(p.CFrame.UpVector.Y) > 0.7 and p.Size.X >= 6 and p.Size.Z >= 6 then
+		-- nur Fahrbahn-Laengsteile (keine Fugen-/Kreuzungsfueller), lokale Z-Achse = Fahrtrichtung, nicht viel breiter als lang
+		if p:IsA("Part") and p.Shape == Enum.PartType.Block and LINE_NAMES[p.Name] and math.abs(p.CFrame.UpVector.Y) > 0.7
+			and p.Size.X >= 6 and p.Size.Z >= 12 and p.Size.X <= 2 * p.Size.Z then
 			if not sample or math.random() < sample then
 				local cf = p.CFrame
 				local top = cf.Position + cf.UpVector * (p.Size.Y / 2) * math.sign(cf.UpVector.Y)
@@ -509,24 +587,39 @@ function RS.Audit(city, opts)
 				rol[i] = math.deg(math.atan2((hs[2] + hs[4]) / 2 - (hs[1] + hs[3]) / 2, 2 * veh.cx))
 				hitName[i] = hn and hn.Name or "?"
 				groundPrev = avg
-				-- Aufsetzen: Kasten-Unterkante (avg + Freiheit) unter dem hoechsten Bodenpunkt unter dem Kasten
-				local bottom = avg + clearance
-				for _, fz in ipairs({ -veh.halfL + 0.3, veh.halfL - 0.3 }) do
+				-- Fahrzeug-Ebene aus den 4 Treffern (Steigung nach vorne / zur Seite) - der Kasten kippt mit
+				local zmid = (-veh.zf - veh.zr) / 2
+				local sF = ((hs[1] + hs[2]) / 2 - (hs[3] + hs[4]) / 2) / (veh.zr - veh.zf) -- Anstieg je Stud in Richtung d
+				local sS = ((hs[2] + hs[4]) / 2 - (hs[1] + hs[3]) / 2) / (2 * veh.cx) -- Anstieg je Stud zur Seite
+				local function bottomAt(fz, fx) return avg + clearance + sF * (fz - zmid) + sS * fx end
+				-- Aufsetzen: Boden unter dem (geneigten) Kasten hoeher als seine Unterkante
+				local oy2 = oy + math.abs(sF) * veh.halfL + math.abs(sS) * veh.halfW
+				for _, fz in ipairs({ -veh.halfL + 0.3, 0, veh.halfL - 0.3 }) do
+					local found = false
 					for _, fx in ipairs({ -veh.halfW + 0.3, 0, veh.halfW - 0.3 }) do
-						local r = cast(Vector3.new(pos.X, oy, pos.Z) + side * fx + d * fz)
-						if r and r.Position.Y > bottom - 0.05 then
+						local r = cast(Vector3.new(pos.X, oy2, pos.Z) + side * fx + d * fz)
+						local b = bottomAt(fz, fx)
+						if r and r.Position.Y > b - 0.05 then
 							cnt.aufsetzen += 1
-							addSpot("aufsetzen", r.Position, r.Position.Y - bottom, r.Instance:GetFullName())
+							addSpot("aufsetzen", r.Position, r.Position.Y - b, r.Instance:GetFullName())
+							found = true
 							break
 						end
 					end
+					if found then break end
 				end
-				-- Anstossen: etwas Kollidierbares im Kasten-Volumen
+				-- Anstossen: etwas Kollidierbares im (geneigten) Kasten-Volumen
 				if i % 4 == 0 then
-					local cf = CFrame.lookAt(Vector3.new(pos.X, avg + clearance + veh.height / 2, pos.Z), Vector3.new(pos.X, avg + clearance + veh.height / 2, pos.Z) + d)
+					local fwd = (d + Vector3.yAxis * sF).Unit
+					local right0 = (side + Vector3.yAxis * sS).Unit
+					local up = right0:Cross(fwd).Unit
+					if up.Y < 0 then up = -up end
+					local right = fwd:Cross(up).Unit
+					local c = Vector3.new(pos.X, avg + clearance - sF * zmid, pos.Z) + up * (veh.height / 2)
+					local cf = CFrame.fromMatrix(c, right, up, -fwd)
 					local hitParts = Workspace:GetPartBoundsInBox(cf, Vector3.new(veh.halfW * 2 - 0.2, veh.height - 0.2, veh.halfL * 2 - 0.2), op)
 					for _, hp in ipairs(hitParts) do
-						if not hp:IsDescendantOf(skin or Workspace.Terrain) and hp.CollisionGroup ~= RS.GROUP_SKIN then
+						if hp.CollisionGroup ~= RS.GROUP_SKIN and not (skin and hp:IsDescendantOf(skin)) then
 							cnt.anstoss += 1
 							addSpot("anstoss", pos, 0, hp:GetFullName())
 							break
@@ -654,7 +747,9 @@ function RS.CarveTerrain(city, opts)
 	local terrain = Workspace.Terrain
 	local backups = folder(folder(ServerStorage, "Backups"), "RoadSmoothTerrain_" .. city)
 	local pieces = skin:GetChildren()
-	local hits, carved = 0, 0
+	local hits, carved, failed = 0, 0, 0
+	local carvedPieces = {}
+	local seq = #backups:GetChildren()
 	for i, p in ipairs(pieces) do
 		if p:IsA("Part") and p.Shape == Enum.PartType.Block then
 			local topCF, e1, e2 = topOf(p)
@@ -670,28 +765,52 @@ function RS.CarveTerrain(city, opts)
 			if poke then
 				hits += 1
 				if not opts.Dry then
-					-- Sicherung des Bereichs (Voxel-Koordinaten, 4 Studs)
-					local pos = topCF.Position
-					local r = math.max(e1, e2) / 2 + 4
-					local lo = Vector3int16.new(math.floor((pos.X - r) / 4), math.floor((pos.Y - 4) / 4), math.floor((pos.Z - r) / 4))
-					local hi = Vector3int16.new(math.ceil((pos.X + r) / 4), math.ceil((pos.Y + 8) / 4), math.ceil((pos.Z + r) / 4))
+					local cf = topCF * CFrame.new(0, 3.02, 0)
+					local sz = Vector3.new(math.max(0.5, e1 - 2 * inset), 6, math.max(0.5, e2 - 2 * inset))
+					-- Weltbox des abzutragenden Blocks (+1 Voxel) sichern
+					local R, U, L = cf.RightVector, cf.UpVector, cf.LookVector
+					local hh = sz / 2
+					local ext = Vector3.new(
+						math.abs(R.X) * hh.X + math.abs(U.X) * hh.Y + math.abs(L.X) * hh.Z,
+						math.abs(R.Y) * hh.X + math.abs(U.Y) * hh.Y + math.abs(L.Y) * hh.Z,
+						math.abs(R.Z) * hh.X + math.abs(U.Z) * hh.Y + math.abs(L.Z) * hh.Z)
+					local a, b = cf.Position - ext, cf.Position + ext
+					local lo = Vector3int16.new(math.floor(a.X / 4) - 1, math.floor(a.Y / 4) - 1, math.floor(a.Z / 4) - 1)
+					local hi = Vector3int16.new(math.ceil(b.X / 4) + 1, math.ceil(b.Y / 4) + 1, math.ceil(b.Z / 4) + 1)
 					local ok, region = pcall(function() return terrain:CopyRegion(Region3int16.new(lo, hi)) end)
 					if ok and region then
-						region.Name = string.format("R_%d_%d_%d", lo.X, lo.Y, lo.Z)
+						seq += 1
+						region.Name = string.format("R%06d", seq)
+						region:SetAttribute("Seq", seq)
 						region:SetAttribute("CornerX", lo.X)
 						region:SetAttribute("CornerY", lo.Y)
 						region:SetAttribute("CornerZ", lo.Z)
 						region.Parent = backups
+						terrain:FillBlock(cf, sz, Enum.Material.Air) -- nur mit Sicherung
+						carved += 1
+						table.insert(carvedPieces, p)
+					else
+						failed += 1
+						warn("RoadSmooth: Gelaende-Sicherung fehlgeschlagen, nicht abgesenkt bei " .. tostring(cf.Position))
 					end
-					terrain:FillBlock(topCF * CFrame.new(0, 3.02, 0), Vector3.new(math.max(0.5, e1 - 2 * inset), 6, math.max(0.5, e2 - 2 * inset)), Enum.Material.Air)
-					carved += 1
 				end
 			end
 		end
 		if i % 100 == 0 then yield(i / #pieces) end
 	end
+	-- Kontrolle: ragt nach dem Absenken noch Gelaende durch? (FillBlock wirkt auf 4-Stud-Voxel nur anteilig)
+	local still = 0
+	for _, p in ipairs(carvedPieces) do
+		local topCF, e1, e2 = topOf(p)
+		local ex, ez = e1 / 2 - inset, e2 / 2 - inset
+		for _, o in ipairs({ { 0, 0 }, { 0.8, 0.8 }, { -0.8, -0.8 } }) do
+			local wp = (topCF * CFrame.new(o[1] * ex, 0, o[2] * ez)).Position
+			if Workspace:Raycast(wp + Vector3.new(0, 6, 0), Vector3.new(0, -6.05, 0), rp) then still += 1 break end
+		end
+	end
 	setStep("fertig", 1)
-	return string.format("%s: Gelaende ragt an %d Hautplatten durch, %s", city, hits, opts.Dry and "(Probe, nichts geaendert)" or (carved .. " abgesenkt, Sicherung in ServerStorage.Backups.RoadSmoothTerrain_" .. city))
+	return string.format("%s: Gelaende ragt an %d Hautplatten durch, %s", city, hits, opts.Dry and "(Probe, nichts geaendert)"
+		or string.format("%d abgesenkt, %d ohne Sicherung uebersprungen, danach ragt noch an %d durch. Sicherung: ServerStorage.Backups.RoadSmoothTerrain_%s", carved, failed, still, city))
 end
 
 function RS.RestoreTerrain(city)
@@ -699,12 +818,14 @@ function RS.RestoreTerrain(city)
 	local f = b and b:FindFirstChild("RoadSmoothTerrain_" .. city)
 	assert(f, "keine Gelaende-Sicherung fuer " .. city)
 	local list = f:GetChildren()
-	-- in umgekehrter Reihenfolge, damit die aeltesten Daten zuletzt geschrieben werden
-	for i = #list, 1, -1 do
-		local r = list[i]
+	-- neueste zuerst, damit die aeltesten (urspruenglichen) Daten zuletzt geschrieben werden
+	table.sort(list, function(x, y) return (x:GetAttribute("Seq") or 0) > (y:GetAttribute("Seq") or 0) end)
+	for i, r in ipairs(list) do
 		Workspace.Terrain:PasteRegion(r, Vector3int16.new(r:GetAttribute("CornerX"), r:GetAttribute("CornerY"), r:GetAttribute("CornerZ")), true)
+		if i % 50 == 0 then yield() end
 	end
-	return string.format("%s: %d Gelaende-Bereiche zurueckgeschrieben", city, #list)
+	f:Destroy()
+	return string.format("%s: %d Gelaende-Bereiche zurueckgeschrieben (Sicherung verbraucht)", city, #list)
 end
 
 ----------------------------------------------------------------------------------------------- Testfahrt (Play-Modus, Server)
@@ -752,68 +873,93 @@ function RS.DriveTest(opts)
 			end
 		end
 	end
-	local result = { Routes = #routes, Bumps = 0, HardBumps = 0, Stuck = 0, MaxVAcc = 0, Spots = {} }
-	for ri, pts in ipairs(routes) do
-		-- Start: LKW an den Routenanfang setzen, Blick zum zweiten Punkt
-		local a, b = pts[1], pts[2]
-		root.Anchored = true
-		model:PivotTo(CFrame.lookAt(a + Vector3.new(0, 1.5, 0), Vector3.new(b.X, a.Y + 1.5, b.Z)))
-		task.wait(0.3)
-		root.Anchored = false
-		if seat.Occupant ~= hum then
-			seat:Sit(hum)
-			task.wait(0.8)
-		end
-		local idx = 2
-		local lastV = root.AssemblyLinearVelocity
-		local lastT = os.clock()
-		local slow = 0
-		local t0 = os.clock()
-		while idx <= #pts and os.clock() - t0 < 120 do
-			local pos = root.Position
-			local tgt = pts[idx]
-			local to = Vector3.new(tgt.X - pos.X, 0, tgt.Z - pos.Z)
-			if to.Magnitude < 8 then
-				idx += 1
-			else
+	local result = { Routes = #routes, Bumps = 0, HardBumps = 0, Airborne = 0, Stuck = 0, MaxVAcc = 0, Spots = {} }
+	local function clearTest()
+		pcall(function()
+			seat:SetAttribute("TestThrottle", nil)
+			seat:SetAttribute("TestSteer", nil)
+			root.Anchored = false
+		end)
+	end
+	local okAll, errAll = pcall(function()
+		for ri, pts in ipairs(routes) do
+			if #pts < 2 then continue end
+			-- Start: Umgebung streamen, LKW an den Routenanfang setzen, Blick zum zweiten Punkt
+			local a, b = pts[1], pts[2]
+			pcall(function() pl:RequestStreamAroundAsync(a, 10) end)
+			root.Anchored = true
+			model:PivotTo(CFrame.lookAt(a + Vector3.new(0, 1.5, 0), Vector3.new(b.X, a.Y + 1.5, b.Z)))
+			task.wait(0.5)
+			root.Anchored = false
+			if seat.Occupant ~= hum then seat:Sit(hum) end
+			task.wait(1.0)
+			pcall(function() root:SetNetworkOwner(pl) end)
+			local settleUntil = os.clock() + 1.5 -- Landung nach dem Versetzen nicht als Stoss werten
+			local idx, slow = 2, 0
+			local lastV, lastT = root.AssemblyLinearVelocity, os.clock()
+			local t0 = os.clock()
+			while idx <= #pts and os.clock() - t0 < 120 do
+				local pos = root.Position
+				local tgt = pts[idx]
+				local to = Vector3.new(tgt.X - pos.X, 0, tgt.Z - pos.Z)
 				local look = root.CFrame.LookVector
-				local fwd = Vector3.new(look.X, 0, look.Z).Unit
-				local ang = math.atan2(fwd:Cross(to.Unit).Y, fwd:Dot(to.Unit))
-				seat:SetAttribute("TestSteer", math.clamp(-ang * 2.5, -1, 1))
-				seat:SetAttribute("TestThrottle", math.abs(ang) > 0.6 and 0.3 or (opts.Speed or 1))
-			end
-			task.wait(1 / 30)
-			local now = os.clock()
-			local v = root.AssemblyLinearVelocity
-			local dtv = math.max(1e-3, now - lastT)
-			local ay = (v.Y - lastV.Y) / dtv
-			if math.abs(ay) > math.abs(result.MaxVAcc) then result.MaxVAcc = ay end
-			if math.abs(ay) > 100 then
-				result.Bumps += 1
-				if math.abs(ay) > 300 then result.HardBumps += 1 end
-				if #result.Spots < 200 then table.insert(result.Spots, { x = math.floor(pos.X), y = math.floor(pos.Y * 10) / 10, z = math.floor(pos.Z), a = math.floor(ay) }) end
-			end
-			local hv = Vector3.new(v.X, 0, v.Z).Magnitude
-			if hv < 3 and (seat:GetAttribute("TestThrottle") or 0) > 0.2 and now - t0 > 2 then
-				slow += dtv
-				if slow > 1.5 then
-					result.Stuck += 1
-					table.insert(result.Spots, { x = math.floor(pos.X), y = math.floor(pos.Y * 10) / 10, z = math.floor(pos.Z), a = 0, stuck = true })
-					idx += 1
+				local fwd = Vector3.new(look.X, 0, look.Z)
+				fwd = (fwd.Magnitude > 1e-3) and fwd.Unit or Vector3.new(0, 0, -1)
+				local dist = to.Magnitude
+				local behind = dist > 1e-3 and fwd:Dot(to.Unit) < -0.2
+				if dist < 8 or (behind and dist < 25 and idx < #pts) then
+					idx += 1 -- erreicht oder schon vorbei: naechster Punkt
+				else
+					local u = to.Unit
+					local ang = math.atan2(fwd:Cross(u).Y, fwd:Dot(u))
+					seat:SetAttribute("TestSteer", math.clamp(-ang * 2.5, -1, 1))
+					local v0 = root.AssemblyLinearVelocity
+					local hv0 = Vector3.new(v0.X, 0, v0.Z).Magnitude
+					local thr = opts.Speed or 1
+					if math.abs(ang) > 0.35 then thr = (hv0 > 18) and -0.6 or 0.35 end -- in Kurven bremsen
+					seat:SetAttribute("TestThrottle", thr)
+				end
+				task.wait(1 / 30)
+				local now = os.clock()
+				local v = root.AssemblyLinearVelocity
+				if now < settleUntil then
+					lastV, lastT = v, now
+				elseif now - lastT >= 0.1 then
+					local ay = (v.Y - lastV.Y) / (now - lastT)
+					local airborne = math.abs(ay + Workspace.Gravity) < 30
+					if airborne then
+						result.Airborne += 1
+					else
+						if math.abs(ay) > math.abs(result.MaxVAcc) then result.MaxVAcc = ay end
+						if math.abs(ay) > 100 then
+							result.Bumps += 1
+							if math.abs(ay) > 300 then result.HardBumps += 1 end
+							if #result.Spots < 200 then table.insert(result.Spots, { x = math.floor(pos.X), y = math.floor(pos.Y * 10) / 10, z = math.floor(pos.Z), a = math.floor(ay) }) end
+						end
+					end
+					lastV, lastT = v, now
+				end
+				local hv = Vector3.new(v.X, 0, v.Z).Magnitude
+				if hv < 3 and (seat:GetAttribute("TestThrottle") or 0) > 0.2 and now > settleUntil + 1 then
+					slow += 1 / 30
+					if slow > 1.5 then
+						result.Stuck += 1
+						table.insert(result.Spots, { x = math.floor(pos.X), y = math.floor(pos.Y * 10) / 10, z = math.floor(pos.Z), a = 0, stuck = true })
+						idx += 1
+						slow = 0
+					end
+				else
 					slow = 0
 				end
-			else
-				slow = 0
 			end
-			lastV, lastT = v, now
+			seat:SetAttribute("TestThrottle", 0)
+			seat:SetAttribute("TestSteer", 0)
+			task.wait(0.5)
+			status.Progress = ri / #routes
 		end
-		seat:SetAttribute("TestThrottle", 0)
-		seat:SetAttribute("TestSteer", 0)
-		task.wait(0.5)
-		status.Progress = ri / #routes
-	end
-	seat:SetAttribute("TestThrottle", nil)
-	seat:SetAttribute("TestSteer", nil)
+	end)
+	clearTest()
+	if not okAll then error(errAll) end
 	RS.LastDrive = result
 	return string.format("Testfahrt: %d Routen | Stoesse >100: %d, >300: %d, max %.0f studs/s² | haengengeblieben: %d", result.Routes, result.Bumps, result.HardBumps, result.MaxVAcc, result.Stuck)
 end
@@ -995,14 +1141,18 @@ function RS.PlaceMeshes(city)
 			table.insert(report, "  alte StrassenMesh-Meshes ins Archiv (ServerStorage.RoadSmoothMeshArchiv)")
 		end
 		local hidden = 0
-		for _, p in ipairs(RS.Collect(city)) do
-			if p.Transparency < 1 and p:GetAttribute("RS_Transparency") == nil then
+		local parts = RS.Collect(city)
+		local under = RS.Under(parts)
+		for _, p in ipairs(parts) do
+			if not under[p] and p.Transparency < 1 and p:GetAttribute("RS_Transparency") == nil then
 				p:SetAttribute("RS_Transparency", p.Transparency)
 				p.Transparency = 1
 				hidden += 1
 			end
 		end
-		table.insert(report, string.format("  %d bisher sichtbare Fahrbahnteile ausgeblendet", hidden))
+		local nUnder = 0
+		for _ in pairs(under) do nUnder += 1 end
+		table.insert(report, string.format("  %d bisher sichtbare Fahrbahnteile ausgeblendet, %d Unterfuehrungs-Teile bleiben sichtbar", hidden, nUnder))
 	else
 		table.insert(report, "  noch nicht alle Meshes da - alte Optik bleibt vorerst")
 	end
@@ -1038,19 +1188,32 @@ end
 
 ----------------------------------------------------------------------------------------------- Hintergrund-Jobs
 -- RS.Run("Build", "Neustadt") / RS.Run("Audit", "Neustadt", {Mode="alt"}) ... dann RS.Status() abfragen
+local generation = 0
 function RS.Run(fname, ...)
 	assert(type(RS[fname]) == "function", "unbekannte Funktion " .. tostring(fname))
-	assert(status.Done, "es laeuft schon: " .. status.Job)
+	assert(status.Done, "es laeuft schon: " .. status.Job .. " (haengt er? RS.Reset())")
 	local args = table.pack(...)
+	generation += 1
+	local gen = generation
 	status.Job = fname .. "(" .. tostring(args[1] or "") .. ")"
 	status.Done, status.Error, status.Result = false, nil, nil
+	status.Step, status.Progress = "", 0
 	status.Started = os.clock()
 	task.spawn(function()
-		local ok, res = pcall(RS[fname], table.unpack(args, 1, args.n))
+		local ok, res = xpcall(RS[fname], debug.traceback, table.unpack(args, 1, args.n))
+		if gen ~= generation then return end -- inzwischen per RS.Reset() abgeloest
 		status.Done = true
 		if ok then status.Result = res else status.Error = tostring(res) end
 	end)
 	return "gestartet: " .. status.Job .. " - Fortschritt mit RS.Status()"
+end
+
+-- Notausgang, falls ein Job haengt (z. B. Play-Modus beendet): Status freigeben. Der alte Job wird ignoriert.
+function RS.Reset()
+	generation += 1
+	local was = status.Job
+	status.Done, status.Error, status.Result = true, nil, "zurueckgesetzt (vorher: " .. was .. ")"
+	return "Status zurueckgesetzt (vorher: " .. was .. ")"
 end
 
 function RS.Status()
@@ -1071,8 +1234,9 @@ function RS.Help()
   RS.Run("CarveTerrain", stadt, {Dry=true})           Gelaende, das durch die Fahrbahn ragt / RS.RestoreTerrain(stadt)
   RS.Status()                         Fortschritt / Ergebnis des Hintergrund-Jobs
   RS.Spots(20, "anstoss"|"aufsetzen"|"loch"|"sprung")  schlimmste Stellen,  RS.Look(i) Kamera dorthin
-  RS.DriveTest({Lines=5})             (nur Play-Modus, Server) Autopilot-Testfahrt mit Stossmessung
-  RS.MeshStatus() / RS.PlaceMeshes(stadt) / RS.RestoreMeshes(stadt)   neue Strassen-Optik (OBJ-Import)
+  RS.Run("DriveTest", {Lines=5})      (nur Play-Modus, Server-Konsole) Autopilot-Testfahrt mit Stossmessung
+  RS.MeshStatus() / RS.Run("PlaceMeshes", stadt) / RS.RestoreMeshes(stadt)   neue Strassen-Optik (OBJ-Import)
+  RS.Reset()                          haengenden Job-Status freigeben
 Staedte: Neustadt, Portavia, Metropolis]]
 end
 

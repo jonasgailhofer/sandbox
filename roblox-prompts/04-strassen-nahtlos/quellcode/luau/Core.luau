@@ -18,6 +18,8 @@ Core.P = {
 	GAPTOL = 0.08, -- Toleranz der Lueckenkacheln
 	GAPMAX = 8, -- maximale Kantenlaenge einer Lueckenkachel (Studs)
 	STEP = 1, -- Abtastweite auf Teil-Oberseiten
+	UNDER = 3, -- Abtastpunkt gilt als verdeckt, wenn die Flaeche so viel hoeher liegt (Unterfuehrung)
+	GAPSLOPE = 0.4, -- Luecken nur zwischen Fahrbahnen schliessen, deren Hoehe hoechstens so steil auseinanderliegt
 }
 
 local NEG = -1e30
@@ -295,7 +297,7 @@ function Core.Mask(g)
 	return m
 end
 
-local function dilate(g, m, r)
+local function dilate(g, m, r, yf)
 	local nx, nz = g.nx, g.nz
 	local out = buffer.create(g.n)
 	local offs = {}
@@ -313,6 +315,7 @@ local function dilate(g, m, r)
 				end
 			end
 		end
+		if yf and k % 128 == 0 then yf() end
 	end
 	return out
 end
@@ -323,10 +326,10 @@ local function invert(g, m)
 end
 
 -- Luecken schliessen (morphologisches Schliessen mit Radius r Zellen). Rueckgabe: Maske 1 = Fahrbahn, 2 = Luecke
-function Core.CloseGaps(g, m, r)
+function Core.CloseGaps(g, m, r, yf)
 	if r <= 0 then return m end
-	local d = dilate(g, m, r)
-	local e = invert(g, dilate(g, invert(g, d), r))
+	local d = dilate(g, m, r, yf)
+	local e = invert(g, dilate(g, invert(g, d), r, yf))
 	local out = buffer.create(g.n)
 	for o = 0, g.n - 1 do
 		local a = buffer.readu8(m, o)
@@ -358,27 +361,49 @@ function Core.Smooth(g, yieldFn)
 		end
 	end
 	-- Luecken
-	local mc = Core.CloseGaps(g, m, ceil(P.CLOSE / g.G))
+	local mc = Core.CloseGaps(g, m, ceil(P.CLOSE / g.G), yieldFn and function() yieldFn(0.6) end)
 	local nx, nz = g.nx, g.nz
 	local rad = ceil(3 * P.SIGMA / g.G)
 	local nGap = 0
+	local maxd = 2 * ceil(P.CLOSE / g.G) + 1
+	local function firstRoad(i, k, di, dk)
+		for d = 1, maxd do
+			local ii, kk = i + di * d, k + dk * d
+			if ii < 0 or kk < 0 or ii >= nx or kk >= nz then return nil end
+			local oo = kk * nx + ii
+			if buffer.readu8(m, oo) ~= 0 then return d, buffer.readf32(f2, oo * 4) end
+		end
+		return nil
+	end
 	for k = 0, nz - 1 do
 		for i = 0, nx - 1 do
 			local o = k * nx + i
 			if buffer.readu8(mc, o) == 2 then
+				-- nur zwischen Fahrbahnen gleicher Ebene schliessen (keine Rampen zwischen Ebenen)
+				local ok = true
+				for _, dir in ipairs({ { 1, 0 }, { 0, 1 }, { 1, 1 }, { 1, -1 } }) do
+					local d1, h1 = firstRoad(i, k, dir[1], dir[2])
+					local d2, h2 = firstRoad(i, k, -dir[1], -dir[2])
+					if d1 and d2 then
+						local run = (d1 + d2) * g.G * ((dir[1] ~= 0 and dir[2] ~= 0) and 1.4142 or 1)
+						if abs(h1 - h2) > P.GAPSLOPE * run + 0.3 then ok = false break end
+					end
+				end
 				local a, b = 0, 0
-				for kk = max(0, k - rad), min(nz - 1, k + rad) do
-					for ii = max(0, i - rad), min(nx - 1, i + rad) do
-						local oo = kk * nx + ii
-						if buffer.readu8(m, oo) ~= 0 then
-							local d2 = ((ii - i) ^ 2 + (kk - k) ^ 2) * g.G * g.G
-							local ww = exp(-0.5 * d2 / (P.SIGMA * P.SIGMA))
-							a += ww * buffer.readf32(f2, oo * 4)
-							b += ww
+				if ok then
+					for kk = max(0, k - rad), min(nz - 1, k + rad) do
+						for ii = max(0, i - rad), min(nx - 1, i + rad) do
+							local oo = kk * nx + ii
+							if buffer.readu8(m, oo) ~= 0 then
+								local d2 = ((ii - i) ^ 2 + (kk - k) ^ 2) * g.G * g.G
+								local ww = exp(-0.5 * d2 / (P.SIGMA * P.SIGMA))
+								a += ww * buffer.readf32(f2, oo * 4)
+								b += ww
+							end
 						end
 					end
 				end
-				if b > 1e-9 then
+				if ok and b > 1e-9 then
 					buffer.writef32(f2, o * 4, a / b)
 					nGap += 1
 				else
@@ -394,13 +419,27 @@ function Core.Smooth(g, yieldFn)
 	return f2, mc
 end
 
--- Wert der glatten Flaeche an (x, z) oder nil
+-- Wert der glatten Flaeche an (x, z) oder nil (bilinear ueber die gueltigen Nachbarzellen)
 function Core.FieldAt(g, x, z)
-	local i, k = floor((x - g.x0) / g.G), floor((z - g.z0) / g.G)
-	if i < 0 or k < 0 or i >= g.nx or k >= g.nz then return nil end
-	local o = k * g.nx + i
-	if buffer.readu8(g.mask, o) == 0 then return nil end
-	return buffer.readf32(g.f, o * 4)
+	local fx, fz = (x - g.x0) / g.G - 0.5, (z - g.z0) / g.G - 0.5
+	local i0, k0 = floor(fx), floor(fz)
+	local tx, tz = fx - i0, fz - k0
+	local s, w = 0, 0
+	for dk = 0, 1 do
+		for di = 0, 1 do
+			local i, k = i0 + di, k0 + dk
+			if i >= 0 and k >= 0 and i < g.nx and k < g.nz then
+				local o = k * g.nx + i
+				if buffer.readu8(g.mask, o) ~= 0 then
+					local ww = ((di == 1) and tx or (1 - tx)) * ((dk == 1) and tz or (1 - tz))
+					s += ww * buffer.readf32(g.f, o * 4)
+					w += ww
+				end
+			end
+		end
+	end
+	if w < 1e-6 then return nil end
+	return s / w
 end
 
 ----------------------------------------------------------------------------------------------- Hautplatten
@@ -419,7 +458,10 @@ function Core.PlaneFit(pts)
 		sxy += x * y; szy += z * y; sy += y
 	end
 	-- Normalgleichungen [sxx sxz sx; sxz szz sz; sx sz n] [a b c'] = [sxy szy sy]
-	local A = { { sxx, sxz, sx, sxy }, { sxz, szz, sz, szy }, { sx, sz, n, sy } }
+	-- leichte Regularisierung: bei Punkten auf einer Linie (auch diagonal) bleibt die Steigung entlang der Linie
+	-- erhalten und quer dazu wird sie 0 (statt zufaellig)
+	local lam = 1e-6 * n + 1e-9 * (sxx + szz)
+	local A = { { sxx + lam, sxz, sx, sxy }, { sxz, szz + lam, sz, szy }, { sx, sz, n, sy } }
 	for c = 1, 3 do
 		local piv, pv = c, abs(A[c][c])
 		for r = c + 1, 3 do if abs(A[r][c]) > pv then piv, pv = r, abs(A[r][c]) end end
@@ -509,15 +551,21 @@ function Core.MakePiece(k, M, c, s, nl, ft, a, b, cc)
 	else
 		ax = (abs(nl[1]) > 0.5) and 1 or ((abs(nl[2]) > 0.5) and 2 or 3)
 	end
-	local h = { s2[1] / 2, s2[2] / 2, s2[3] / 2 }
-	local tl = { 0, 0, 0 } -- Mitte der Oberseite (lokal)
-	tl[ax] = sgn(nl2[ax]) * h[ax]
-	if ft == "tri" then
-		tl[2] = -h[2] / 3
-		tl[3] = h[3] / 3
+	-- Mitte der Oberseite im ORIGINAL-Teil (Drehung erfolgt um diesen Punkt, damit dicke Teile nicht seitlich wandern)
+	local top
+	if ft == "slope" then
+		top = { c[1], c[2], c[3] } -- die Schraege geht durch die lokale Mitte
+	else
+		local h0 = { s[1] / 2, s[2] / 2, s[3] / 2 }
+		local tl = { 0, 0, 0 }
+		tl[ax] = sgn(nl[ax]) * h0[ax]
+		if ft == "tri" then
+			tl[2] = -h0[2] / 3
+			tl[3] = h0[3] / 3
+		end
+		local tw = mulv(M, tl)
+		top = { c[1] + tw[1], c[2] + tw[2], c[3] + tw[3] }
 	end
-	local tw = mulv(M2, tl)
-	local top = { c[1] + tw[1], c[2] + tw[2], c[3] + tw[3] }
 	top[2] = a * top[1] + b * top[3] + cc
 	local s3 = { s2[1], s2[2], s2[3] }
 	s3[ax] = P.THICK
@@ -544,6 +592,7 @@ function Core.PiecesFor(g, p)
 	local nl = { nx, ny, nz }
 	local upc = mulv(M, nl)[2]
 	if upc < 0.5 then return {}, "steil" end
+	local covered = 0
 	local function samplesWorld(cx, cy, cz, sx, sy, sz)
 		local loc = Core.FaceSamples(p.k, nx, ny, nz, ft, sx, sy, sz)
 		local out = {}
@@ -551,7 +600,14 @@ function Core.PiecesFor(g, p)
 			local w = mulv(M, q)
 			local x, z = cx + w[1], cz + w[3]
 			local f = Core.FieldAt(g, x, z)
-			if f then table.insert(out, { x, z, f }) end
+			if f then
+				-- liegt die glatte Flaeche hier deutlich hoeher (andere Ebene darueber), gehoert der Punkt nicht zu diesem Teil
+				if f - (cy + w[2]) < P.UNDER then
+					table.insert(out, { x, z, f })
+				else
+					covered += 1
+				end
+			end
 		end
 		return out
 	end
@@ -585,15 +641,23 @@ function Core.PiecesFor(g, p)
 		if #subs == 0 then return {}, "keinFeld" end
 	end
 	local out = {}
+	local rejected = 0
 	for _, sb in ipairs(subs) do
 		local pts = samplesWorld(sb[1], sb[2], sb[3], sb[4], sb[5], sb[6])
 		if #pts >= 3 then
 			local a, b, c, err = Core.PlaneFit(pts)
-			local pc = Core.MakePiece(p.k == 3 and 0 or p.k, M, { sb[1], sb[2], sb[3] }, { sb[4], sb[5], sb[6] }, nl, ft, a, b, c)
-			pc.err = err
-			table.insert(out, pc)
+			local up = 1 / sqrt(1 + a * a + b * b)
+			-- keine steilen oder schlecht passenden Platten (z.B. an der Kante einer darueberliegenden Ebene)
+			if err <= 0.5 and up >= min(upc, 0.9) - 0.1 then
+				local pc = Core.MakePiece(p.k == 3 and 0 or p.k, M, { sb[1], sb[2], sb[3] }, { sb[4], sb[5], sb[6] }, nl, ft, a, b, c)
+				pc.err = err
+				table.insert(out, pc)
+			else
+				rejected += 1
+			end
 		end
 	end
+	if covered > 0 or rejected > 0 then return out, "unter" end
 	return out, (#subs > 1) and "geteilt" or "ok"
 end
 
@@ -647,11 +711,14 @@ function Core.GapPieces(g)
 			if buffer.readu8(g.mask, o) == 2 and buffer.readu8(seen, o) == 0 then
 				-- Rechteck um zusammenhaengende Lueckenzellen in diesem Block wachsen lassen
 				local i1, k1 = i, k
-				while i1 + 1 < nx and i1 - i + 1 < maxc and buffer.readu8(g.mask, k * nx + i1 + 1) == 2 do i1 += 1 end
+				while i1 + 1 < nx and i1 - i + 1 < maxc and buffer.readu8(g.mask, k * nx + i1 + 1) == 2 and buffer.readu8(seen, k * nx + i1 + 1) == 0 do
+					i1 += 1
+				end
 				local grow = true
 				while grow and k1 + 1 < nz and k1 - k + 1 < maxc do
 					for ii = i, i1 do
-						if buffer.readu8(g.mask, (k1 + 1) * nx + ii) ~= 2 then grow = false break end
+						local oo = (k1 + 1) * nx + ii
+						if buffer.readu8(g.mask, oo) ~= 2 or buffer.readu8(seen, oo) ~= 0 then grow = false break end
 					end
 					if grow then k1 += 1 end
 				end
@@ -677,7 +744,8 @@ function Core.Jumps(seq, thr, n)
 			if i < n and seq[i + 1] then table.insert(pr, seq[i + 1] - seq[i]) end
 			local pred = 0
 			if #pr == 2 then
-				pred = (pr[1] + pr[2]) / 2
+				-- der kleinere Nachbar-Anstieg ist die erwartete Steigung (sonst wird eine Stufe dreimal gezaehlt)
+				pred = (abs(pr[1]) <= abs(pr[2])) and pr[1] or pr[2]
 			elseif #pr == 1 then
 				pred = pr[1]
 			end

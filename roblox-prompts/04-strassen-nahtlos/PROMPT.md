@@ -65,19 +65,29 @@ Hänger oder Hindernisse, wenn man mit dem LKW darüberfährt.
 `local RS = require(game.ServerStorage.DevTools.RoadSmooth)` und dann `print(RS.Help())`.
 
 1. **Fahrwerk v2** (`RS.InstallTruck()`):
-   - Die Strahlen ignorieren Teile ohne Kollision und nutzen die Kollisionsgruppe `TruckRay`.
+   - Die Strahlen ignorieren Teile ohne Kollision, andere Fahrzeuge (`World.Vehicles`) und nutzen die Kollisionsgruppe `TruckRay`.
+   - Wo an einer Stelle (noch) keine Fahrhaut liegt, sehen sie automatisch die alte Fahrbahn. Es gibt also kein Durchsacken.
    - Ein Alpha-Beta-Höhenfilter folgt Steigungen ohne Verzug und glättet Kanten.
-   - Vorausschau-Strahlen an der Stoßstange heben den LKW rechtzeitig an.
+     Nach Kuppen schwebt der LKW höchstens 0,6 Studs nach.
+   - Die Mindesthöhe rechnet mit dem **geneigten** Kasten (Hang, Kuppe zwischen den Achsen).
+   - Vorausschau-Strahlen an der Stoßstange sehen nur Fahrhaut und Gelände. Vor flachen Stufen heben sie stetig an,
+     um höchstens 1 Stud. Mauern, Fahrzeuge und Gegenstände bleiben Hindernisse, der LKW klettert nicht darauf.
    - Die Neigung wird weich nachgeführt.
-   - Simuliert: **75 % weniger harte Stöße**.
+   - Simuliert auf 1.500 echten Fahrlinien: **74 % weniger harte Stöße**.
 2. **Fahrhaut** (`RS.Run("Build", stadt)`):
-   - Eine unsichtbare, geglättete Fläche über allen Fahrbahnen, ca. 12.000 Platten für alle drei Städte, Gruppe `RoadSkin`.
-   - Die alten Platten kommen in die Gruppe `RoadBase`. Die sieht nur noch das Fahrwerk nicht, Figuren laufen normal darauf.
-   - Kleine Lücken bis 4 Studs werden geschlossen. Unterführungen bleiben unverändert.
+   - Eine unsichtbare, geglättete Fläche über allen Fahrbahnen, ca. 11.400 Platten für alle drei Städte, Gruppe `RoadSkin`.
+   - Die Haut existiert **nur für das Fahrwerk**: Figuren, der Kasten, andere Raycasts und Overlaps gehen durch sie hindurch.
+   - Sie ist `Persistent`, wird also nie weggestreamt.
+   - Die alten Platten kommen in die Gruppe `RoadBase`, aber nur, wenn die Haut sie nachweislich zu ≥ 90 % abdeckt
+     (Raycast-Prüfung). Die sieht nur noch das Fahrwerk nicht, Figuren laufen normal darauf.
+   - Kleine Lücken bis 4 Studs werden geschlossen, aber nur zwischen Fahrbahnen auf gleicher Höhe.
+     So entstehen keine Rampen zwischen zwei Ebenen.
+   - Unterführungen bleiben unverändert. Ebenso Schiffsdecks, `Deck` zählt nur unter `Bridges`.
    - Der Rechenkern ist gegen eine unabhängige Python-Referenz auf deinen echten Daten getestet: Abweichung ≤ 0,008, Abdeckung ≈ 100 %.
-3. **Neue Optik** (`RS.PlaceMeshes(stadt)` nach dem OBJ-Import):
+3. **Neue Optik** (`RS.Run("PlaceMeshes", stadt)` nach dem OBJ-Import):
    - Meshes aus **derselben** glatten Fläche: Optik und Fahrfläche liegen deckungsgleich.
-   - 97 Meshes, ca. 172.000 Dreiecke, also weniger als die alten Meshes.
+   - 96 Meshes, ca. 171.000 Dreiecke, also weniger als die alten Meshes.
+   - Fahrbahnteile unter einer anderen Fahrbahn (Unterführung) bleiben sichtbar, die Meshes decken sie nicht ab.
    - Asphalt, Kopfstein und Schotter getrennt, Kanten leicht gerundet.
    - Randschürzen nur dort, wo das Gelände tiefer liegt.
 4. **Audit** (`RS.Run("Audit", stadt, {Mode = "alt" | "neu"})`):
@@ -86,12 +96,24 @@ Hänger oder Hindernisse, wenn man mit dem LKW darüberfährt.
    - Liefert eine Liste der schlimmsten Stellen: `RS.Spots(20)`, `RS.Look(i)` richtet die Kamera für Screenshots aus.
 5. **Gelände** (`RS.Run("CarveTerrain", stadt, {Dry = true})`): Gelände, das durch die Fahrhaut ragt, wird knapp über
    der Fahrbahn abgesenkt. Das Original wird vorher als TerrainRegion gesichert.
-6. **Testfahrt** (`RS.DriveTest({Lines = 6})`, nur im Play-Modus auf dem Server): Autopilot über die Studio-Testattribute
-   des Sitzes. Misst Stöße und Hängenbleiben.
+6. **Testfahrt** (`RS.Run("DriveTest", {Lines = 6})`, nur im Play-Modus in der **Server**-Konsole, dann `RS.Status()`):
+   - Autopilot über die Studio-Testattribute des Sitzes. Der LKW wird an den Routenanfang gesetzt und bremst in Kurven.
+   - Misst Stöße, Luftsprünge und Hängenbleiben. Die Stellen stehen in `RS.LastDrive.Spots`.
 7. **Alles ist rückgängig zu machen:** `RS.Restore(stadt)`, `RS.RestoreTerrain(stadt)`, `RS.UninstallTruck()`, `RS.RestoreMeshes(stadt)`.
 
 Lange Funktionen startest du mit `RS.Run(...)` im Hintergrund und fragst alle 20–30 s `RS.Status()` ab.
 So läuft dir kein MCP-Aufruf in einen Timeout.
+- Fehler kommen mit vollständigem Traceback zurück.
+- Hängt der Status, zum Beispiel weil der Play-Modus beendet wurde: `RS.Reset()`.
+
+Wichtige Hinweise:
+- **Vor `RS.InstallTruck()`** den Skript-Tab von `StarterPlayerScripts.Client.Truck` schließen, falls er offen ist.
+  - Ist Collaborative Editing (Team Create) an, danach im Skript prüfen, dass oben „[RoadSmooth] Fahrwerk v2“ steht.
+  - Falls ein Entwurf (Draft) offen ist: committen.
+- **Nach `RS.PlaceMeshes`** nicht mehr `StrassenMeshU.Place`/`StrassenMeshU.Restore` benutzen.
+  Die holen die alten Meshes bzw. Abschnitte zurück und es gibt doppelte Flächen. Zurück geht es nur mit `RS.RestoreMeshes(stadt)`.
+- Die Haut ist für alles außer dem Fahrwerk unsichtbar und durchlässig.
+  Eigene Raycasts, etwa von Verkehr, Fußgängern oder Platzierung, sehen weiter die alten Fahrbahnteile. Das ist gewollt.
 
 ## Harte Regeln
 1. Lies zuerst `ServerStorage.DevTools.PolishLog` und lege **Block V „Straßen nahtlos (RoadSmooth)“** an.
@@ -112,17 +134,20 @@ So läuft dir kein MCP-Aufruf in einen Timeout.
 - `print(RS.Help())`.
 - Für alle drei Städte: `RS.Run("Audit", stadt, {Mode = "alt"})` (warten, `RS.Status()`).
   Zahlen notieren, `RS.Spots(15)` sichten, die 3 schlimmsten Stellen je Stadt per `RS.Look(i)` + Screenshot festhalten.
-- Wenn der Play-Modus per MCP geht: `RS.DriveTest({Lines = 6})` mit dem **alten** Fahrwerk als Vergleich.
+- Wenn der Play-Modus per MCP geht: `RS.Run("DriveTest", {Lines = 6})` in der Server-Konsole mit dem **alten** Fahrwerk
+  als Vergleich (`RS.Status()` bis fertig).
 
 **Phase 1: Fahrwerk**
 - `RS.InstallTruck()`.
-- Playtest: Prüfe in der Konsole, dass das Fahrwerk ohne Fehler startet. Dann `RS.DriveTest({Lines = 6})` und mit Phase 0 vergleichen.
+- Playtest: Prüfe in der Konsole, dass das Fahrwerk ohne Fehler startet.
+  Dann `RS.Run("DriveTest", {Lines = 6})` und mit Phase 0 vergleichen.
 - Kurz selbst prüfen:
   - Rückwärtsfahren
   - Rampe hoch und runter
   - Brücke
   - Autobahn-Reise (`HighwayTrigger`)
   - Parken/Aussteigen
+  - Hinter einem anderen LKW herfahren: Er darf nicht auf ihn hinaufklettern.
 - Nichts darf schlechter sein.
 
 **Phase 2: Fahrhaut**
@@ -162,8 +187,9 @@ Zu jeder Stelle: `RS.Look(i)` + Screenshot, Ursache benennen, minimal beheben. D
 
 **Phase 5: Optik**
 - Falls ich die OBJ-Dateien noch nicht importiert habe: sag mir kurz Bescheid und warte.
-- `RS.MeshStatus()`, dann je Stadt `RS.PlaceMeshes(stadt)`.
+- `RS.MeshStatus()`, dann je Stadt `RS.Run("PlaceMeshes", stadt)` (`RS.Status()` bis fertig).
   Es setzt die Meshes, archiviert die alten `StrassenMesh`-Meshes und blendet noch sichtbare alte Fahrbahnteile aus.
+  Unterführungen bleiben sichtbar.
 - Screenshots aus den Referenzkameras (Tag und Nacht). Prüfe:
   - Kanten an Bordsteinen
   - Übergänge Asphalt/Kopfstein

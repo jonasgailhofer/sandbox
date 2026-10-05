@@ -13,7 +13,9 @@ os.makedirs(OUT, exist_ok=True)
 names = np.array([p.rsplit('/', 1)[1] for p in E.paths])
 ROAD = {'Road', 'RoadFill', 'RoadRamp', 'SlitFill', 'RoadBevel', 'Asphalt', 'Joint', 'JointSquare', 'Lane', 'LaneJoint',
         'LaneLink', 'TurnCircle', 'EndCap', 'Deck', 'Track', 'Yard'}
-EXCL = {'CaseScenes', 'Plots', 'FahrHaut', 'StrassenMesh', 'StrassenMesh2', 'Landschaft', 'Fleet', 'Decor', 'Trading', 'Hub', 'Staging'}
+EXCL = {'CaseScenes', 'Plots', 'FahrHaut', 'StrassenMesh', 'StrassenMesh2', 'Landschaft', 'Fleet', 'Decor', 'Trading', 'Hub', 'Staging',
+        'Ausflugsschiff', 'Containerschiff'}
+UNDER = 3.0
 MAT = {256: 'Plastic', 272: 'SmoothPlastic', 816: 'Concrete', 836: 'Pavement', 880: 'Cobblestone', 1376: 'Asphalt', 1360: 'Ground', 864: 'Pebble', 1088: 'Metal', 512: 'Wood', 528: 'WoodPlanks', 1296: 'Sand', 800: 'Slate', 848: 'Brick', 832: 'Granite'}
 P = dict(SIMPLIFY=0.15, TILE=512, MAXAREA=60.0, MINAREA=1.5, VTOL=0.05, DENS=4.0, CLOSE=2.0, ROUND=0.3, SKIRT=0.6, MAXTRI=18000)
 
@@ -25,9 +27,29 @@ def collect(city):
         if names[j] not in ROAD or E.kind[j] in (5,): continue
         segs = E.paths[j].split('/')
         if segs[1] != 'World' or any(s in EXCL for s in segs[2:-1]): continue
+        if names[j] == 'Deck' and 'Bridges' not in segs[:-1]: continue  # Deck nur bei Bruecken (nicht Schiffe/Buehnen)
         if city_of_x(E.C[j, 0]) != city: continue
         out.append(j)
     return np.array(out)
+
+def find_under(js):
+    """mirror of RS.Under: dense top samples (step 2), upward ray from y+0.05 against the collected parts;
+    first hit further than UNDER above -> part is (partly) under another road -> excluded (stays as it is)"""
+    Jset = set(js.tolist()); under = set()
+    for j in js:
+        nloc, ft = S.top_face(j)
+        loc = S._fs(E.kind[j], nloc, ft, E.S[j], step=2.0)
+        if len(loc) == 0: continue
+        w = E.C[j] + loc @ E.R[j].T
+        J = E.cands(E.C[j, 0], E.C[j, 2], pad=max(E.H[j, 0], E.H[j, 2]))
+        J = np.array([x for x in J if x in Jset and x != j])
+        if len(J) == 0: continue
+        lo, hi = E.intervals(w[:, 0], w[:, 2], J)
+        y0 = w[:, 1:2] + 0.05
+        cand = np.where(np.isfinite(lo) & (lo > y0) & (lo < y0 + 80), lo, np.inf)
+        first = cand.min(1) - y0[:, 0]
+        if np.any(np.isfinite(first) & (first > UNDER)): under.add(int(j))
+    return under
 
 # -------------------------------------------------------------------------------------------- field (mirror of Core.Smooth)
 def build_field(js):
@@ -64,7 +86,27 @@ def build_field(js):
             zs = slice(max(0, dk), s.shape[1] + min(0, dk)); zd = slice(max(0, -dk), s.shape[1] + min(0, -dk))
             sh[xs, zs] = sv[xd, zd]; shm[xs, zs] = m[xd, zd]
             num += w * sh; den += w * shm
-    g = gap & (den > 1e-9)
+    # nur zwischen Fahrbahnen gleicher Ebene schliessen (mirror Core.Smooth: GAPSLOPE 0.4, +0.3, maxd 5)
+    ok = np.ones_like(m)
+    maxd = 5
+    def first_road(di, dk):
+        dist = np.full(m.shape, np.nan); val = np.full(m.shape, np.nan)
+        for d in range(1, maxd + 1):
+            sh_m = np.zeros_like(m); sh_v = np.full(s.shape, np.nan)
+            ai, ak = di * d, dk * d
+            xs = slice(max(0, -ai), m.shape[0] + min(0, -ai)); xd = slice(max(0, ai), m.shape[0] + min(0, ai))
+            zs = slice(max(0, -ak), m.shape[1] + min(0, -ak)); zd = slice(max(0, ak), m.shape[1] + min(0, ak))
+            sh_m[xs, zs] = m[xd, zd]; sh_v[xs, zs] = s[xd, zd]
+            new = np.isnan(dist) & sh_m
+            dist[new] = d; val[new] = sh_v[new]
+        return dist, val
+    for di, dk in ((1, 0), (0, 1), (1, 1), (1, -1)):
+        d1, h1 = first_road(di, dk); d2, h2 = first_road(-di, -dk)
+        both = ~np.isnan(d1) & ~np.isnan(d2)
+        run = (np.nan_to_num(d1) + np.nan_to_num(d2)) * F.G * (1.4142 if di != 0 and dk != 0 else 1.0)
+        bad = both & (np.abs(np.nan_to_num(h1) - np.nan_to_num(h2)) > 0.4 * run + 0.3)
+        ok &= ~bad
+    g = gap & (den > 1e-9) & ok
     s = np.where(g, num / np.maximum(den, 1e-12), s)
     F.f = s; F.mask = np.where(m, 1, np.where(g, 2, 0)).astype(np.uint8)
     return F
@@ -220,7 +262,9 @@ def neighbor_top(xs, zs, ey):
 def mesh_city(city):
     t0 = time.time()
     js = collect(city)
-    print(city, 'drivable parts', len(js), flush=True)
+    under = find_under(js)
+    js = np.array([j for j in js if int(j) not in under])
+    print(city, 'drivable parts', len(js), 'under (excluded)', len(under), flush=True)
     F = build_field(js)
     ff = filled_field(F)
     global FIELD_FN, ROADSET

@@ -3,8 +3,11 @@
 --   * Bodenstrahlen ignorieren Teile ohne Kollision (Markierungen, Trigger, Marker, Deko-Meshes) und nutzen die
 --     Kollisionsgruppe "TruckRay" (sieht die glatte Fahrhaut statt der alten Fahrbahn-Abschnitte).
 --   * Hoehe wird mit einem Alpha-Beta-Filter geglaettet: folgt Steigungen ohne Verzug, kleine Kanten werden weich.
---   * Vorausschau-Strahlen an der Stossstange heben den LKW rechtzeitig an, statt gegen Kanten zu fahren.
+--   * Vorausschau-Strahlen an der Stossstange heben den LKW rechtzeitig an, statt gegen Kanten zu fahren
+--     (nur flache, befahrbare Stufen bis MAX_LIFT; Waende, Fahrzeuge, Gegenstaende bleiben Hindernisse).
+--   * Mindesthoehe rechnet mit dem geneigten Kasten (Hang, Kuppe), nicht mit einem waagrechten.
 --   * Neigung (Up-Vektor) wird weich nachgefuehrt.
+--   * Fehlt die Fahrhaut an einer Stelle (Streaming, noch nicht gebaut), sehen die Strahlen die alte Fahrbahn.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local PhysicsService = game:GetService("PhysicsService")
@@ -23,6 +26,9 @@ local CLEAR = 0.25 -- Mindestabstand Kasten-Unterkante ueber dem hoechsten Boden
 local SAG = 0.6 -- so weit darf die gefilterte Hoehe unter der gemessenen liegen (Studs)
 local UP_RATE = 10 -- Nachfuehrung der Neigung (1/s)
 local LOOKAHEAD = 0.18 -- Sekunden Vorausschau fuer die Stossstangen-Strahlen
+local MAX_LIFT = 1.0 -- Vorausschau/Mitte: hoechstens so viel zusaetzliches Anheben (hoehere Stufen = Hindernis, Kasten stoesst an)
+local RAMP = 0.25 -- Vorausschau: Steigung, die der Kasten durch Kippen selbst schafft (wird ab der Stossstange abgezogen)
+local FLOAT = 0.6 -- gefilterte Hoehe hoechstens so weit ueber der gemessenen (kein Nachschweben nach Kuppen)
 
 local function groupExists(name)
 	local ok, res = pcall(function() return PhysicsService:IsCollisionGroupRegistered(name) end)
@@ -87,23 +93,41 @@ local function start(seat, model)
 	local pivotOff = root.CFrame:ToObjectSpace(model:GetPivot())
 	local ride = -pivotOff.Position.Y
 	-- Kasten (Kollision): halbe Laenge/Breite und Bodenfreiheit
-	local halfL, halfW = root.Size.Z / 2, root.Size.X / 2
-	local clearance = ride - root.Size.Y / 2
+	local halfL, halfW, halfH = root.Size.Z / 2, root.Size.X / 2, root.Size.Y / 2
 	local maxSpeed = (model:GetAttribute("MaxSpeed") or 44) * 1.25
 	local accel = (model:GetAttribute("Accel") or 14) * 1.3
 	local turn = model:GetAttribute("Turn") or 1
 	local speed = 0
 	local _, yaw = root.CFrame:ToEulerAnglesYXZ()
+	local useSkin = groupExists("TruckRay")
+	-- Bodenstrahlen: sehen die Fahrhaut (TruckRay), nicht die alten Abschnitte
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.RespectCanCollide = true
-	if groupExists("TruckRay") then params.CollisionGroup = "TruckRay" end
+	if useSkin then params.CollisionGroup = "TruckRay" end
+	-- Rueckfall: normale Gruppe, sieht die alte Fahrbahn (falls dort keine Haut ist)
+	local baseParams = RaycastParams.new()
+	baseParams.FilterType = Enum.RaycastFilterType.Exclude
+	baseParams.RespectCanCollide = true
+	-- Vorausschau: nur Fahrhaut + Gelaende (keine Fahrzeuge, Mauern, Gegenstaende)
+	local laParams = RaycastParams.new()
+	laParams.FilterType = Enum.RaycastFilterType.Include
+	laParams.RespectCanCollide = true
+	if useSkin then laParams.CollisionGroup = "TruckRay" end
+	local laInclude = false
 	local function refreshFilter()
 		local list = { model }
 		for _, p in ipairs(Players:GetPlayers()) do if p.Character then table.insert(list, p.Character) end end
 		local g = workspace:FindFirstChild("ClientGhosts")
 		if g then table.insert(list, g) end
+		local world = workspace:FindFirstChild("World")
+		local veh = world and world:FindFirstChild("Vehicles")
+		if veh then table.insert(list, veh) end
 		params.FilterDescendantsInstances = list
+		baseParams.FilterDescendantsInstances = list
+		local skin = world and world:FindFirstChild("FahrHaut")
+		laInclude = skin ~= nil
+		laParams.FilterDescendantsInstances = skin and { skin, workspace.Terrain } or {}
 	end
 	refreshFilter()
 	local gui = Tr.Gui
@@ -115,9 +139,24 @@ local function start(seat, model)
 	-- Filterzustand
 	local fy, fv = nil, 0 -- gefilterte Bodenhoehe und deren Aenderungsrate
 	local upF = root.CFrame.UpVector
+	local DOWN = Vector3.new(0, -40, 0)
 	local function cast(wp)
-		local hit = workspace:Raycast(wp + Vector3.new(0, 6, 0), Vector3.new(0, -40, 0), params)
-		return hit and hit.Position or nil
+		local o = wp + Vector3.new(0, 6, 0)
+		local hit = workspace:Raycast(o, DOWN, params)
+		if useSkin and not (hit and hit.Instance.CollisionGroup == "RoadSkin") then
+			-- keine Haut getroffen: liegt die alte Fahrbahn hoeher? (Haut fehlt hier) -> die nehmen
+			local b = workspace:Raycast(o, DOWN, baseParams)
+			if b and (not hit or b.Position.Y > hit.Position.Y + 0.4) then hit = b end
+		end
+		return hit
+	end
+	-- Vorausschau-Strahl: von knapp ueber der hoechsten noch befahrbaren Stufe nach unten (hoeher = unsichtbar)
+	-- (base = Hoehe der Bodenebene unter den Raedern, bis zu dieser Stelle verlaengert, plus Rampen-Toleranz)
+	local function castAhead(wp, base)
+		local top = base + (ride - halfH) + MAX_LIFT + 1.5
+		local o = Vector3.new(wp.X, top, wp.Z)
+		if laInclude then return workspace:Raycast(o, DOWN, laParams) end
+		return workspace:Raycast(o, DOWN, params)
 	end
 	active.Conn = RunService.Heartbeat:Connect(function(dt)
 		if not seat.Parent or seat.Occupant == nil or not root.Parent then stop() return end
@@ -157,24 +196,13 @@ local function start(seat, model)
 		local rc = root.CFrame
 		local flatCF = CFrame.new(rc.Position) * CFrame.Angles(0, yaw, 0)
 		local pts, n = {}, 0
-		local maxHit = -math.huge
 		for _, c in ipairs(corners) do
-			local hp = cast(flatCF * c)
-			if hp then
+			local h = cast(flatCF * c)
+			if h then
 				n += 1
-				pts[#pts + 1] = hp
-				if hp.Y > maxHit then maxHit = hp.Y end
+				pts[#pts + 1] = h.Position
 			else
 				pts[#pts + 1] = false
-			end
-		end
-		-- Vorausschau an der Stossstange (in Fahrtrichtung): links, Mitte, rechts
-		if math.abs(speed) > 1 then
-			local dir = (speed > 0) and -1 or 1 -- lokal -Z = vorne
-			local ahead = halfL + math.clamp(math.abs(speed) * LOOKAHEAD, 1, 10)
-			for _, sx in ipairs({ -halfW + 0.3, 0, halfW - 0.3 }) do
-				local hp = cast(flatCF * Vector3.new(sx, 0, dir * ahead))
-				if hp and hp.Y > maxHit then maxHit = hp.Y end
 			end
 		end
 		local fwd = Vector3.new(-math.sin(yaw), 0, -math.cos(yaw))
@@ -202,15 +230,49 @@ local function start(seat, model)
 				fy = pred + math.min(1, ALPHA * k) * res
 				fv = fv + math.min(1, BETA * k) * res / math.max(dt, 1e-3)
 			end
-			-- Sicherheitsgrenzen: nicht zu tief unter dem Boden, Kasten immer ueber dem hoechsten Punkt
-			local lb = math.max(raw - SAG, maxHit + CLEAR - clearance)
+			-- Neigung weich nachfuehren (vor den Grenzen: die rechnen mit der Ziel-Neigung)
+			upF = upF:Lerp(up, 1 - math.exp(-UP_RATE * dt))
+			upF = (upF.Magnitude > 0.01) and upF.Unit or Vector3.yAxis
+			-- Obergrenze: nicht ueber Kuppen hinaus schweben
+			if fy > raw + FLOAT then
+				fy = raw + FLOAT
+				if fv > 0 then fv = 0 end
+			end
+			-- Untergrenze: Unterkante des GENEIGTEN Kastens (Ziel- und Ist-Neigung) ueber dem Bodenpunkt hp mindestens CLEAR
+			local cx, cz = rc.Position.X, rc.Position.Z
+			local ru = rc.UpVector
+			local function need(hp)
+				local dx, dz = hp.X - cx, hp.Z - cz
+				local a = (halfH + upF.X * dx + upF.Z * dz) / math.max(upF.Y, 0.6)
+				local b = (halfH + ru.X * dx + ru.Z * dz) / math.max(ru.Y, 0.6)
+				return hp.Y + CLEAR + math.max(a, b) - ride
+			end
+			local lb = raw - SAG
+			for _, p in ipairs(pts) do
+				if p then lb = math.max(lb, need(p)) end
+			end
+			-- Mitte (Kuppe zwischen den Achsen) und Vorausschau (Stufe vor der Stossstange): nur flache Flaechen,
+			-- Anheben stetig auf MAX_LIFT begrenzt (kein Ein/Aus-Sprung)
+			local function consider(h, minus)
+				if h and h.Normal.Y > 0.8 then
+					lb = math.max(lb, math.min(need(h.Position) - minus, raw + MAX_LIFT))
+				end
+			end
+			consider(cast(flatCF.Position), 0)
+			if math.abs(speed) > 1 then
+				local dir = (speed > 0) and -1 or 1 -- lokal -Z = vorne
+				local ahead = halfL + math.clamp(math.abs(speed) * LOOKAHEAD, 1, 10)
+				local tol = RAMP * (ahead - halfL) -- sanfte Rampen schafft der Kasten durch Kippen
+				for _, sx in ipairs({ -halfW + 0.3, 0, halfW - 0.3 }) do
+					local wp = flatCF * Vector3.new(sx, 0, dir * ahead)
+					local base = avg.Y - (up.X * (wp.X - avg.X) + up.Z * (wp.Z - avg.Z)) / up.Y
+					consider(castAhead(wp, base + tol), tol)
+				end
+			end
 			if fy < lb then
 				fy = lb
 				if fv < 0 then fv = 0 end
 			end
-			-- Neigung weich nachfuehren
-			upF = upF:Lerp(up, 1 - math.exp(-UP_RATE * dt))
-			upF = (upF.Magnitude > 0.01) and upF.Unit or Vector3.yAxis
 			ap.Enabled = true
 			ap.Position = Vector3.new(rc.Position.X, fy + ride, rc.Position.Z)
 			local look = (fwd - upF * fwd:Dot(upF)).Unit
