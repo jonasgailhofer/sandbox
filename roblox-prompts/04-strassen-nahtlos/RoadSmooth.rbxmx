@@ -1,0 +1,2479 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><External>null</External><External>nil</External><Item class="ModuleScript" referent="RBX00000004"><Properties><string name="Name">RoadSmooth</string><ProtectedString name="Source"><![CDATA[--!native
+-- RoadSmooth: nahtlose Strassen fuer den LKW (Edit-Modus-Werkzeug, DevTools).
+--   Idee: eine unsichtbare, geglaettete "Fahrhaut" ueber allen Fahrbahnen. Nur sie sieht das Fahrwerk des LKW
+--   (Kollisionsgruppe TruckRay); die alten Abschnitte (Gruppe RoadBase) bleiben fuer Figuren, Optik und Kasten-Kollision.
+--   Dazu: LKW-genaues Audit mit echten Raycasts, Gelaende-Korrektur, automatische Testfahrt, Mesh-Platzierung.
+--
+--   local RS = require(game.ServerStorage.DevTools.RoadSmooth)
+--   print(RS.Help())
+--
+-- Alles ist rueckgaengig zu machen: RS.Restore(stadt), RS.RestoreTerrain(stadt), RS.UninstallTruck(), RS.RestoreMeshes(stadt).
+local RS = {}
+
+local Workspace = game:GetService("Workspace")
+local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PhysicsService = game:GetService("PhysicsService")
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local StarterPlayer = game:GetService("StarterPlayer")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+
+local Core = require(script:WaitForChild("Core"))
+RS.Core = Core
+RS.VERSION = "1.0"
+RS.LastAudit = nil
+RS.LastDrive = nil
+
+RS.CITIES = { "Neustadt", "Portavia", "Metropolis" }
+RS.ROADNAMES = {
+	Road = true, RoadFill = true, RoadRamp = true, SlitFill = true, RoadBevel = true, Asphalt = true, Joint = true,
+	JointSquare = true, Lane = true, LaneJoint = true, LaneLink = true, TurnCircle = true, EndCap = true, Deck = true,
+	Track = true, Yard = true,
+}
+-- Ordner, deren Inhalt nie Fahrbahn ist (auch wenn Teile dort so heissen)
+RS.EXCLUDE = {
+	CaseScenes = true, Plots = true, FahrHaut = true, StrassenMesh = true, StrassenMesh2 = true, Landschaft = true,
+	Fleet = true, Decor = true, Trading = true, Hub = true, Staging = true, Ausflugsschiff = true, Containerschiff = true,
+}
+RS.GROUP_BASE, RS.GROUP_SKIN, RS.GROUP_RAY = "RoadBase", "RoadSkin", "TruckRay"
+RS.UNDER = 3 -- Teil liegt unter einer anderen Fahrbahn (Unterfuehrung), wenn diese mehr als so hoch darueber liegt
+
+-- Van (kleinstes Fahrzeug, haeufigster Fall) und Titan40 (laengstes) fuer das Audit
+RS.VEHICLES = {
+	Van = { cx = 2.75, zf = -5.4, zr = 5.2, ride = 5.08, halfL = 8.5, halfW = 3.3, height = 7.44 },
+	Titan = { cx = 3.75, zf = -17.6, zr = 19.2, ride = 7.88, halfL = 23, halfW = 4.3, height = 11.84 },
+}
+
+----------------------------------------------------------------------------------------------- Hilfen
+local function cityOfX(x)
+	if x > 4000 then return "Portavia" end
+	if x < -4000 then return "Metropolis" end
+	return "Neustadt"
+end
+RS.CityOfX = cityOfX
+
+local function world()
+	return Workspace:FindFirstChild("World")
+end
+
+local function excluded(p)
+	local a = p.Parent
+	while a and a ~= Workspace do
+		if RS.EXCLUDE[a.Name] then return true end
+		a = a.Parent
+	end
+	return false
+end
+
+-- Fahrbahnteil? ("Deck" nur bei Bruecken, nicht bei Schiffen/Buehnen)
+local function isRoad(p)
+	if not RS.ROADNAMES[p.Name] then return false end
+	if p.Name == "Deck" and not p:FindFirstAncestor("Bridges") then return false end
+	return true
+end
+RS.IsRoad = isRoad
+
+local function folder(parent, name)
+	local f = parent:FindFirstChild(name)
+	if not f then
+		f = Instance.new("Folder")
+		f.Name = name
+		f.Parent = parent
+	end
+	return f
+end
+
+local status = { Job = "-", Step = "", Progress = 0, Started = 0, Done = true, Error = nil }
+RS.State = status
+local function setStep(step, prog)
+	status.Step = step
+	status.Progress = prog or 0
+end
+local lastYield = os.clock()
+local function yield(prog)
+	if prog then status.Progress = prog end
+	if os.clock() - lastYield > 0.05 then
+		task.wait()
+		lastYield = os.clock()
+	end
+end
+
+-- Teil -> Tabelle fuer Core
+function RS.PartInfo(p)
+	local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = p.CFrame:GetComponents()
+	local k = 0
+	if p:IsA("WedgePart") then
+		k = 1
+	elseif p:IsA("Part") then
+		if p.Shape == Enum.PartType.Cylinder then
+			k = 2
+		elseif p.Shape == Enum.PartType.Ball then
+			k = 3
+		elseif p.Shape == Enum.PartType.Wedge then
+			k = 1
+		end
+	end
+	return { k = k, x = x, y = y, z = z, r = { r00, r01, r02, r10, r11, r12, r20, r21, r22 }, sx = p.Size.X, sy = p.Size.Y, sz = p.Size.Z }
+end
+
+----------------------------------------------------------------------------------------------- Kollisionsgruppen
+function RS.Groups()
+	for _, g in ipairs({ RS.GROUP_BASE, RS.GROUP_SKIN, RS.GROUP_RAY }) do
+		if not PhysicsService:IsCollisionGroupRegistered(g) then PhysicsService:RegisterCollisionGroup(g) end
+	end
+	-- Fahrwerks-Strahlen sehen die alten Abschnitte nicht mehr, nur die Haut (und alles andere wie bisher)
+	PhysicsService:CollisionGroupSetCollidable(RS.GROUP_RAY, RS.GROUP_BASE, false)
+	PhysicsService:CollisionGroupSetCollidable(RS.GROUP_RAY, RS.GROUP_SKIN, true)
+	-- die Haut existiert fuer alles andere nicht (Figuren, Kasten, andere Raycasts, Overlaps)
+	for _, info in ipairs(PhysicsService:GetRegisteredCollisionGroups()) do
+		local name = info.name
+		if name ~= RS.GROUP_RAY and name ~= RS.GROUP_SKIN then
+			PhysicsService:CollisionGroupSetCollidable(RS.GROUP_SKIN, name, false)
+		end
+	end
+	return "Gruppen bereit: RoadBase (alte Fahrbahn), RoadSkin (Haut, nur fuer TruckRay sichtbar), TruckRay (Fahrwerks-Strahlen, ignoriert RoadBase)"
+end
+
+----------------------------------------------------------------------------------------------- Sammeln
+-- alle Fahrbahnteile einer Stadt
+function RS.Collect(city)
+	local W = world()
+	assert(W, "workspace.World fehlt")
+	local out = {}
+	for _, p in ipairs(W:GetDescendants()) do
+		if p:IsA("BasePart") and isRoad(p) and p.CanCollide and not p:IsA("MeshPart") and not p:IsA("UnionOperation") then
+			if cityOfX(p.Position.X) == city and not excluded(p) then table.insert(out, p) end
+		end
+	end
+	return out
+end
+
+-- Teile, die (auch nur teilweise) unter einer anderen Fahrbahn liegen (Unterfuehrung): bleiben unveraendert
+-- (keine Haut, Gruppe bleibt, Optik bleibt sichtbar). Dichte Abtastung der Oberseite (alle 2 Studs).
+function RS.Under(parts)
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Include
+	rp.FilterDescendantsInstances = parts
+	local under = {}
+	for i, p in ipairs(parts) do
+		local info = RS.PartInfo(p)
+		local nx, ny, nz, ft = Core.TopFace(info)
+		local loc = Core.FaceSamples(info.k, nx, ny, nz, ft, info.sx, info.sy, info.sz, 2)
+		for _, q in ipairs(loc) do
+			local wp = p.CFrame:PointToWorldSpace(Vector3.new(q[1], q[2], q[3]))
+			local r = Workspace:Raycast(wp + Vector3.new(0, 0.05, 0), Vector3.new(0, 80, 0), rp)
+			if r and r.Instance ~= p and r.Distance > RS.UNDER then
+				under[p] = true
+				break
+			end
+		end
+		if i % 100 == 0 then yield() end
+	end
+	return under
+end
+
+----------------------------------------------------------------------------------------------- Haut bauen
+local function skinFolder(city, create)
+	local W = world()
+	local root = W:FindFirstChild("FahrHaut")
+	if not root then
+		if not create then return nil end
+		root = Instance.new("Folder")
+		root.Name = "FahrHaut"
+		root.Parent = W
+	end
+	local f = root:FindFirstChild(city)
+	if not f and create then
+		-- Persistent: die Haut ist auf jedem Client immer vollstaendig da (kein Streaming-Loch unter dem LKW)
+		f = Instance.new("Model")
+		f.Name = city
+		f.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
+		f.Parent = root
+	end
+	return f
+end
+
+-- Feld (geglaettete Flaeche) einer Stadt berechnen; Rueckgabe grid, parts, infos, under
+function RS.Field(city)
+	setStep("Sammeln", 0)
+	local parts = RS.Collect(city)
+	setStep("Unterfuehrungen", 0.05)
+	local under = RS.Under(parts)
+	local list, infos = {}, {}
+	local x0, z0, x1, z1 = math.huge, math.huge, -math.huge, -math.huge
+	for _, p in ipairs(parts) do
+		if not under[p] then
+			local info = RS.PartInfo(p)
+			table.insert(list, p)
+			table.insert(infos, info)
+			local ex, _, ez = Core.Extents(info)
+			x0 = math.min(x0, info.x - ex); x1 = math.max(x1, info.x + ex)
+			z0 = math.min(z0, info.z - ez); z1 = math.max(z1, info.z + ez)
+		end
+	end
+	assert(#list > 0, "keine Fahrbahnteile in " .. city)
+	local g = Core.NewGrid(math.floor(x0) - 8, math.floor(z0) - 8, math.ceil(x1) + 8, math.ceil(z1) + 8, Core.P.G)
+	setStep("Rastern", 0.1)
+	for i, info in ipairs(infos) do
+		Core.RasterPart(g, info, i)
+		if i % 100 == 0 then yield(0.1 + 0.1 * i / #infos) end
+	end
+	setStep("Glaetten", 0.2)
+	Core.Smooth(g, function(t) yield(0.2 + 0.4 * t) end)
+	return g, list, infos, under
+end
+
+local function makePart(pc)
+	local p
+	if pc.k == 1 then
+		p = Instance.new("WedgePart")
+	else
+		p = Instance.new("Part")
+		if pc.k == 2 then p.Shape = Enum.PartType.Cylinder end
+	end
+	p.Name = pc.gap and "HautLuecke" or "Haut"
+	p.Anchored = true
+	p.CanCollide = true
+	p.CanQuery = true
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Transparency = 1
+	p.Material = Enum.Material.SmoothPlastic
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Size = Vector3.new(pc.sx, pc.sy, pc.sz)
+	local r = pc.r
+	p.CFrame = CFrame.new(pc.x, pc.y, pc.z, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9])
+	p.CollisionGroup = RS.GROUP_SKIN
+	pcall(function() p.AudioCanCollide = false end)
+	p.Locked = true
+	return p
+end
+
+-- Fahrhaut einer Stadt bauen (ersetzt eine vorhandene). opts: { Dry = true } -> nur zaehlen
+function RS.Build(city, opts)
+	opts = opts or {}
+	RS.Groups()
+	local t0 = os.clock()
+	local g, list, infos, under = RS.Field(city)
+	setStep("Hautplatten", 0.6)
+	-- nur Teile, die irgendwo oben liegen (andere sind komplett verdeckt)
+	local owners = {}
+	for o = 0, g.n - 1 do
+		local id = buffer.readi32(g.own, o * 4)
+		if id ~= 0 then owners[id] = true end
+	end
+	local pieces, stat = {}, {}
+	local partial = {} -- teilweise verdeckt: bleiben fuer die Fahrwerks-Strahlen sichtbar
+	for i, info in ipairs(infos) do
+		if owners[i] then
+			local pc, st = Core.PiecesFor(g, info)
+			stat[st] = (stat[st] or 0) + 1
+			if st == "unter" then partial[list[i]] = true end
+			for _, q in ipairs(pc) do table.insert(pieces, q) end
+		end
+		if i % 100 == 0 then yield(0.6 + 0.15 * i / #infos) end
+	end
+	local gaps = Core.GapPieces(g)
+	for _, q in ipairs(gaps) do table.insert(pieces, q) end
+	-- Abweichung Haut - alte Oberkante (grosse Werte = grosse Stufen, die die Haut nur abmildert)
+	local dev = {}
+	local big = {}
+	for o = 0, g.n - 1 do
+		if buffer.readu8(g.mask, o) == 1 then
+			local d = buffer.readf32(g.f, o * 4) - buffer.readf32(g.top, o * 4)
+			table.insert(dev, d)
+			if math.abs(d) > 0.3 and #big < 4000 then
+				local i, k = o % g.nx, o // g.nx
+				table.insert(big, { g.x0 + (i + 0.5) * g.G, buffer.readf32(g.top, o * 4), g.z0 + (k + 0.5) * g.G, d })
+			end
+		end
+	end
+	table.sort(dev)
+	local function pct(q) return dev[math.max(1, math.floor(#dev * q))] or 0 end
+	local function count(t) local n = 0 for _ in pairs(t) do n += 1 end return n end
+	local summary = string.format(
+		"%s: %d Fahrbahnteile (%d Unterfuehrung, %d teilweise verdeckt, %d oben), %d Hautplatten (%d Luecken), geteilt %d, Haut-alt: 1%% %.2f / 50%% %.2f / 99%% %.2f, Stellen >0.3: %d",
+		city, #list + count(under), count(under), count(partial), count(owners), #pieces, #gaps, stat["geteilt"] or 0, pct(0.01), pct(0.5), pct(0.99), #big)
+	if opts.Dry then
+		setStep("fertig (Probe)", 1)
+		return summary
+	end
+	-- alte Haut weg, neue anlegen
+	setStep("Teile anlegen", 0.75)
+	local old = skinFolder(city, false)
+	if old then old:Destroy() end
+	local f = skinFolder(city, true)
+	for i, pc in ipairs(pieces) do
+		makePart(pc).Parent = f
+		if i % 200 == 0 then yield(0.75 + 0.2 * i / #pieces) end
+	end
+	-- alte Fahrbahn fuer die Fahrwerks-Strahlen ausblenden (Gruppe RoadBase) - aber nur, wo die Haut sie wirklich abdeckt.
+	-- Unterfuehrungen, teilweise verdeckte und nicht abgedeckte Teile bleiben in ihrer Gruppe.
+	setStep("Gruppen setzen", 0.95)
+	local skinRp = RaycastParams.new()
+	skinRp.FilterType = Enum.RaycastFilterType.Include
+	skinRp.FilterDescendantsInstances = { f }
+	skinRp.CollisionGroup = RS.GROUP_RAY -- die Haut ist nur fuer TruckRay sichtbar
+	local toBase = {}
+	local notCovered = 0
+	for idx, p in ipairs(list) do
+		if not partial[p] then
+			local info = infos[idx]
+			local nx, ny, nz, ft = Core.TopFace(info)
+			local loc = Core.FaceSamples(info.k, nx, ny, nz, ft, info.sx, info.sy, info.sz, 2)
+			local hit, tot = 0, 0
+			for _, q in ipairs(loc) do
+				local wp = p.CFrame:PointToWorldSpace(Vector3.new(q[1], q[2], q[3]))
+				tot += 1
+				local r = Workspace:Raycast(wp + Vector3.new(0, 3, 0), Vector3.new(0, -6, 0), skinRp)
+				if r then hit += 1 end
+			end
+			if tot > 0 and hit >= 0.9 * tot then
+				toBase[p] = true
+			else
+				notCovered += 1
+			end
+		end
+		if idx % 100 == 0 then yield(0.95 + 0.04 * idx / #list) end
+	end
+	-- fruehere RoadBase-Teile dieser Stadt, die jetzt nicht mehr dazugehoeren, zuruecksetzen
+	local nBack = 0
+	for _, p in ipairs(world():GetDescendants()) do
+		if p:IsA("BasePart") and not toBase[p] then
+			local og = p:GetAttribute("RS_Group")
+			if og ~= nil and cityOfX(p.Position.X) == city then
+				p.CollisionGroup = og
+				p:SetAttribute("RS_Group", nil)
+				nBack += 1
+			end
+		end
+	end
+	local n = 0
+	for p in pairs(toBase) do
+		if p:GetAttribute("RS_Group") == nil then p:SetAttribute("RS_Group", p.CollisionGroup) end
+		p.CollisionGroup = RS.GROUP_BASE
+		n += 1
+	end
+	f:SetAttribute("Version", RS.VERSION)
+	f:SetAttribute("Built", os.date("%Y-%m-%d %H:%M"))
+	f:SetAttribute("Pieces", #pieces)
+	f:SetAttribute("Summary", summary)
+	-- grosse Stufen merken (fuer Bericht/Nacharbeit)
+	local bigJson = HttpService:JSONEncode(big)
+	local rep = folder(ServerStorage, "RoadSmoothReport")
+	local sv = rep:FindFirstChild(city .. "_Stufen") or Instance.new("StringValue")
+	sv.Name = city .. "_Stufen"
+	sv.Value = string.sub(bigJson, 1, 190000)
+	sv.Parent = rep
+	setStep("fertig", 1)
+	return summary .. string.format(" | %d Teile -> RoadBase, %d nicht voll abgedeckt (bleiben sichtbar fuer das Fahrwerk), %d zurueckgesetzt | %.1fs", n, notCovered, nBack, os.clock() - t0)
+end
+
+-- Haut entfernen, Gruppen der alten Fahrbahn zuruecksetzen
+function RS.Restore(city)
+	local f = skinFolder(city, false)
+	local nSkin = 0
+	if f then
+		nSkin = #f:GetChildren()
+		f:Destroy()
+	end
+	local n = 0
+	for _, p in ipairs(world():GetDescendants()) do
+		if p:IsA("BasePart") and p:GetAttribute("RS_Group") ~= nil and cityOfX(p.Position.X) == city then
+			p.CollisionGroup = p:GetAttribute("RS_Group")
+			p:SetAttribute("RS_Group", nil)
+			n += 1
+		end
+	end
+	return string.format("%s: %d Hautplatten entfernt, %d Teile zurueck in ihre Gruppe", city, nSkin, n)
+end
+
+----------------------------------------------------------------------------------------------- Fahrwerk
+local function truckScript()
+	local sps = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+	local client = sps and sps:FindFirstChild("Client")
+	return client and client:FindFirstChild("Truck")
+end
+
+-- Quelltext setzen: ueber ScriptEditorService (funktioniert auch bei offenem Skript-Tab / Collaborative Editing),
+-- sonst direkt .Source
+local function setSource(sc, text)
+	local ok = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(sc, function() return text end)
+	end)
+	if not ok or sc.Source ~= text then sc.Source = text end
+	return sc.Source == text
+end
+
+local function isRoadSmoothTruck(source)
+	return string.find(source, "[RoadSmooth] Fahrwerk", 1, true) ~= nil
+end
+
+function RS.InstallTruck()
+	local tr = truckScript()
+	assert(tr and tr:IsA("ModuleScript"), "StarterPlayerScripts.Client.Truck nicht gefunden")
+	local src = script:WaitForChild("TruckNeu")
+	if tr.Source == src.Source then
+		RS.Groups()
+		return "Fahrwerk v2 ist schon installiert"
+	end
+	local bk = folder(ServerStorage, "ScriptBackups")
+	local old = bk:FindFirstChild("Truck_vorRoadSmooth")
+	-- Backup nur vom Fahrwerk OHNE RoadSmooth (bei einem Update von v2 auf eine neuere v2 bleibt das Original-Backup)
+	if not isRoadSmoothTruck(tr.Source) then
+		if old and old.Source ~= tr.Source then
+			-- Truck wurde seit dem letzten Backup geaendert: altes Backup behalten (mit Datum), aktuellen Stand sichern
+			old.Name = "Truck_vorRoadSmooth_" .. os.date("%Y%m%d_%H%M%S")
+			old = nil
+		end
+		if not old then
+			local c = tr:Clone()
+			c.Name = "Truck_vorRoadSmooth"
+			c.Parent = bk
+		end
+	end
+	assert(setSource(tr, src.Source), "Quelltext liess sich nicht setzen - Truck-Skript-Tab schliessen und nochmal")
+	RS.Groups()
+	return "Fahrwerk v2 installiert (Backup: ServerStorage.ScriptBackups.Truck_vorRoadSmooth)"
+end
+
+function RS.UninstallTruck(force)
+	local tr = truckScript()
+	local bk = ServerStorage:FindFirstChild("ScriptBackups")
+	local old = bk and bk:FindFirstChild("Truck_vorRoadSmooth")
+	assert(tr and old, "Backup oder Truck-Modul fehlt")
+	assert(force or isRoadSmoothTruck(tr.Source),
+		"Truck-Modul ist kein RoadSmooth-Fahrwerk (spaeter geaendert?) - RS.UninstallTruck(true) setzt trotzdem das Backup zurueck")
+	assert(setSource(tr, old.Source), "Quelltext liess sich nicht setzen - Truck-Skript-Tab schliessen und nochmal")
+	return "altes Fahrwerk wiederhergestellt"
+end
+
+----------------------------------------------------------------------------------------------- Audit
+-- Strahl-Parameter wie im Fahrwerk: "neu" (RespectCanCollide + TruckRay) oder "alt" (wie bisher)
+local function rayParams(mode)
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local ex = {}
+	for _, pl in ipairs(Players:GetPlayers()) do if pl.Character then table.insert(ex, pl.Character) end end
+	local cg = Workspace:FindFirstChild("ClientGhosts")
+	if cg then table.insert(ex, cg) end
+	-- LKW-Modelle (alle Modelle mit DriverSeat) ausschliessen
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("VehicleSeat") then
+			local m = d:FindFirstAncestorWhichIsA("Model")
+			if m then table.insert(ex, m) end
+		end
+	end
+	if mode == "alt" then
+		-- Ausgangslage wie vor dem Bau: die Haut gibt es fuer diese Strahlen nicht
+		local fh = world() and world():FindFirstChild("FahrHaut")
+		if fh then table.insert(ex, fh) end
+	end
+	rp.FilterDescendantsInstances = ex
+	if mode ~= "alt" then
+		rp.RespectCanCollide = true
+		if PhysicsService:IsCollisionGroupRegistered(RS.GROUP_RAY) then rp.CollisionGroup = RS.GROUP_RAY end
+	end
+	return rp, ex
+end
+
+-- Fahrlinien: Mittellinie jedes Fahrbahn-Blocks entlang lokal Z (+1.5 Studs ueber die Enden) und NavData-Linien
+local LINE_NAMES = { Road = true, Lane = true, Asphalt = true, RoadRamp = true, Deck = true, Track = true, Yard = true }
+local function drivingLines(city, sample)
+	local lines = {}
+	for _, p in ipairs(RS.Collect(city)) do
+		-- nur Fahrbahn-Laengsteile (keine Fugen-/Kreuzungsfueller), lokale Z-Achse = Fahrtrichtung, nicht viel breiter als lang
+		if p:IsA("Part") and p.Shape == Enum.PartType.Block and LINE_NAMES[p.Name] and math.abs(p.CFrame.UpVector.Y) > 0.7
+			and p.Size.X >= 6 and p.Size.Z >= 12 and p.Size.X <= 2 * p.Size.Z then
+			if not sample or math.random() < sample then
+				local cf = p.CFrame
+				local top = cf.Position + cf.UpVector * (p.Size.Y / 2) * math.sign(cf.UpVector.Y)
+				local d = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+				if d.Magnitude > 0.5 then
+					d = d.Unit
+					local half = p.Size.Z / 2 + 1.5
+					local pts = {}
+					for t = -half, half, 0.5 do table.insert(pts, top + d * t) end
+					table.insert(lines, { pts = pts, src = p })
+				end
+			end
+		end
+	end
+	local ok, nav = pcall(function()
+		local m = ReplicatedStorage.Modules.NavData:Clone()
+		local t = require(m)
+		m:Destroy()
+		return t
+	end)
+	if ok and type(nav) == "table" then
+		for _, r in ipairs(nav) do
+			if r.Name == city then
+				for _, l in ipairs(r.Lines or {}) do
+					if not sample or math.random() < sample then
+						local P = l.P
+						local pts = {}
+						for k = 1, #P // 3 - 1 do
+							local a = Vector3.new(P[3 * k - 2], P[3 * k - 1], P[3 * k])
+							local b = Vector3.new(P[3 * k + 1], P[3 * k + 2], P[3 * k + 3])
+							local L = (Vector3.new(b.X, 0, b.Z) - Vector3.new(a.X, 0, a.Z)).Magnitude
+							local n = math.max(1, math.floor(L / 0.5))
+							for s = 0, n - 1 do table.insert(pts, a:Lerp(b, s / n)) end
+						end
+						if #pts > 4 then table.insert(lines, { pts = pts, nav = true }) end
+					end
+				end
+			end
+		end
+	end
+	return lines
+end
+
+-- LKW-genaues Audit. opts: { Mode = "neu"|"alt", Vehicle = "Van"|"Titan", Sample = 0..1 (Anteil der Linien), Max = Spots }
+function RS.Audit(city, opts)
+	opts = opts or {}
+	local mode = opts.Mode or "neu"
+	local veh = RS.VEHICLES[opts.Vehicle or "Van"]
+	local rp, ex = rayParams(mode)
+	local skin = skinFolder(city, false)
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	local opEx = table.clone(ex)
+	if skin then table.insert(opEx, skin) end
+	op.FilterDescendantsInstances = opEx
+	op.RespectCanCollide = true
+	setStep("Audit: Linien", 0)
+	local lines = drivingLines(city, opts.Sample)
+	local corners = { { -veh.cx, veh.zf }, { veh.cx, veh.zf }, { -veh.cx, veh.zr }, { veh.cx, veh.zr } }
+	local clearance = veh.ride - veh.height / 2
+	local spots = {}
+	local cnt = { samples = 0, sprung15 = 0, sprung40 = 0, sprung100 = 0, neigung = 0, loch = 0, aufsetzen = 0, anstoss = 0 }
+	local function addSpot(kind, pos, mag, hit)
+		table.insert(spots, { t = kind, x = math.floor(pos.X * 10) / 10, y = math.floor(pos.Y * 10) / 10, z = math.floor(pos.Z * 10) / 10, m = math.floor(mag * 100) / 100, h = hit })
+	end
+	local function cast(origin)
+		local r = Workspace:Raycast(origin, Vector3.new(0, -40, 0), rp)
+		return r
+	end
+	for li, L in ipairs(lines) do
+		local pts = L.pts
+		local seq, pit, rol = {}, {}, {}
+		local hitName = {}
+		local groundPrev = nil
+		for i, pos in ipairs(pts) do
+			local nxt = pts[math.min(#pts, i + 1)]
+			local prv = pts[math.max(1, i - 1)]
+			local d = Vector3.new(nxt.X - prv.X, 0, nxt.Z - prv.Z)
+			if d.Magnitude < 1e-3 then d = Vector3.new(0, 0, -1) end
+			d = d.Unit
+			local side = Vector3.new(-d.Z, 0, d.X)
+			local base = (groundPrev or pos.Y)
+			local oy = base + veh.ride + 6
+			local hs, n, maxHit = {}, 0, -math.huge
+			local hn = nil
+			for ci, c in ipairs(corners) do
+				local wp = Vector3.new(pos.X, oy, pos.Z) + side * c[1] + d * (-c[2])
+				local r = cast(wp)
+				if r then
+					hs[ci] = r.Position.Y
+					n += 1
+					if r.Position.Y > maxHit then maxHit = r.Position.Y; hn = r.Instance end
+				end
+			end
+			cnt.samples += 1
+			if n >= 3 then
+				local s, c = 0, 0
+				for ci = 1, 4 do if hs[ci] then s += hs[ci]; c += 1 end end
+				local avg = s / c
+				for ci = 1, 4 do hs[ci] = hs[ci] or avg end
+				seq[i] = avg
+				pit[i] = math.deg(math.atan2((hs[1] + hs[2]) / 2 - (hs[3] + hs[4]) / 2, veh.zr - veh.zf))
+				rol[i] = math.deg(math.atan2((hs[2] + hs[4]) / 2 - (hs[1] + hs[3]) / 2, 2 * veh.cx))
+				hitName[i] = hn and hn.Name or "?"
+				groundPrev = avg
+				-- Fahrzeug-Ebene aus den 4 Treffern (Steigung nach vorne / zur Seite) - der Kasten kippt mit
+				local zmid = (-veh.zf - veh.zr) / 2
+				local sF = ((hs[1] + hs[2]) / 2 - (hs[3] + hs[4]) / 2) / (veh.zr - veh.zf) -- Anstieg je Stud in Richtung d
+				local sS = ((hs[2] + hs[4]) / 2 - (hs[1] + hs[3]) / 2) / (2 * veh.cx) -- Anstieg je Stud zur Seite
+				local function bottomAt(fz, fx) return avg + clearance + sF * (fz - zmid) + sS * fx end
+				-- Aufsetzen: Boden unter dem (geneigten) Kasten hoeher als seine Unterkante
+				local oy2 = oy + math.abs(sF) * veh.halfL + math.abs(sS) * veh.halfW
+				for _, fz in ipairs({ -veh.halfL + 0.3, 0, veh.halfL - 0.3 }) do
+					local found = false
+					for _, fx in ipairs({ -veh.halfW + 0.3, 0, veh.halfW - 0.3 }) do
+						local r = cast(Vector3.new(pos.X, oy2, pos.Z) + side * fx + d * fz)
+						local b = bottomAt(fz, fx)
+						if r and r.Position.Y > b - 0.05 then
+							cnt.aufsetzen += 1
+							addSpot("aufsetzen", r.Position, r.Position.Y - b, r.Instance:GetFullName())
+							found = true
+							break
+						end
+					end
+					if found then break end
+				end
+				-- Anstossen: etwas Kollidierbares im (geneigten) Kasten-Volumen
+				if i % 4 == 0 then
+					local fwd = (d + Vector3.yAxis * sF).Unit
+					local right0 = (side + Vector3.yAxis * sS).Unit
+					local up = right0:Cross(fwd).Unit
+					if up.Y < 0 then up = -up end
+					local right = fwd:Cross(up).Unit
+					local c = Vector3.new(pos.X, avg + clearance - sF * zmid, pos.Z) + up * (veh.height / 2)
+					local cf = CFrame.fromMatrix(c, right, up, -fwd)
+					local hitParts = Workspace:GetPartBoundsInBox(cf, Vector3.new(veh.halfW * 2 - 0.2, veh.height - 0.2, veh.halfL * 2 - 0.2), op)
+					for _, hp in ipairs(hitParts) do
+						if hp.CollisionGroup ~= RS.GROUP_SKIN and not (skin and hp:IsDescendantOf(skin)) then
+							cnt.anstoss += 1
+							addSpot("anstoss", pos, 0, hp:GetFullName())
+							break
+						end
+					end
+				end
+			else
+				seq[i] = false
+				cnt.loch += 1
+				if not (seq[i - 1] == false) then addSpot("loch", pos, 0, "") end
+			end
+			if i % 50 == 0 then yield() end
+		end
+		-- Spruenge (Hoehe) und Neigungs-Rucke
+		local s2 = {}
+		for i = 1, #pts do s2[i] = seq[i] or nil end
+		for _, j in ipairs(Core.Jumps(s2, 0.15, #pts)) do
+			local a = math.abs(j.j)
+			cnt.sprung15 += 1
+			if a > 0.4 then cnt.sprung40 += 1 end
+			if a > 1.0 then cnt.sprung100 += 1 end
+			if a > 0.4 then addSpot("sprung", pts[j.i], j.j, hitName[j.i] or "?") end
+		end
+		for i = 2, #pts do
+			if pit[i] and pit[i - 1] and (math.abs(pit[i] - pit[i - 1]) > 2 or math.abs((rol[i] or 0) - (rol[i - 1] or 0)) > 2) then
+				cnt.neigung += 1
+			end
+		end
+		status.Progress = li / #lines
+	end
+	-- Spots zusammenfassen (je 6 Studs nur der staerkste je Art)
+	local cell = {}
+	local merged = {}
+	table.sort(spots, function(a, b) return math.abs(a.m) > math.abs(b.m) end)
+	for _, s in ipairs(spots) do
+		local key = s.t .. ":" .. math.floor(s.x / 6) .. ":" .. math.floor(s.z / 6)
+		if not cell[key] then
+			cell[key] = true
+			table.insert(merged, s)
+		end
+	end
+	local rank = { anstoss = 1, aufsetzen = 2, loch = 3, sprung = 4 }
+	table.sort(merged, function(a, b)
+		if rank[a.t] ~= rank[b.t] then return rank[a.t] < rank[b.t] end
+		return math.abs(a.m) > math.abs(b.m)
+	end)
+	local max = opts.Max or 1500
+	while #merged > max do table.remove(merged) end
+	local res = { City = city, Mode = mode, Vehicle = opts.Vehicle or "Van", Lines = #lines, Counts = cnt, Spots = merged, At = os.date("%Y-%m-%d %H:%M") }
+	local rep = folder(ServerStorage, "RoadSmoothReport")
+	local name = string.format("%s_Audit_%s", city, mode)
+	local sv = rep:FindFirstChild(name) or Instance.new("StringValue")
+	sv.Name = name
+	sv.Value = string.sub(HttpService:JSONEncode(res), 1, 190000)
+	sv.Parent = rep
+	RS.LastAudit = res
+	setStep("fertig", 1)
+	return RS.AuditText(res)
+end
+
+function RS.AuditText(res)
+	local c = res.Counts
+	local per = 1000 / math.max(1, c.samples)
+	local byType = {}
+	for _, s in ipairs(res.Spots) do byType[s.t] = (byType[s.t] or 0) + 1 end
+	return string.format(
+		"%s [%s, %s] %d Linien, %d Messpunkte | Spruenge >0.15: %d (%.1f/1000)  >0.4: %d  >1: %d | Neigungsrucke >2°: %d | Loecher: %d | Aufsetzen: %d | Anstossen: %d | Stellen: anstoss %d, aufsetzen %d, loch %d, sprung %d",
+		res.City, res.Mode, res.Vehicle, res.Lines, c.samples, c.sprung15, c.sprung15 * per, c.sprung40, c.sprung100, c.neigung,
+		c.loch, c.aufsetzen, c.anstoss, byType.anstoss or 0, byType.aufsetzen or 0, byType.loch or 0, byType.sprung or 0)
+end
+
+-- die schlimmsten Stellen als Text
+function RS.Spots(n, typ)
+	local res = RS.LastAudit
+	if not res then return "erst RS.Audit(stadt) ausfuehren" end
+	local out = {}
+	for i, s in ipairs(res.Spots) do
+		if not typ or s.t == typ then
+			table.insert(out, string.format("%d. %s %.2f bei (%.0f, %.1f, %.0f) %s", i, s.t, s.m, s.x, s.y, s.z, s.h or ""))
+			if #out >= (n or 20) then break end
+		end
+	end
+	return table.concat(out, "\n")
+end
+
+-- Kamera auf eine Stelle richten (fuer Screenshots), i = Index in RS.LastAudit.Spots
+function RS.Look(i, dist)
+	local s = RS.LastAudit and RS.LastAudit.Spots[i]
+	assert(s, "Stelle nicht gefunden")
+	dist = dist or 28
+	local target = Vector3.new(s.x, s.y, s.z)
+	local cam = Workspace.CurrentCamera
+	cam.CFrame = CFrame.lookAt(target + Vector3.new(dist * 0.7, dist * 0.6, dist * 0.7), target)
+	return string.format("Kamera auf %s (%.0f, %.1f, %.0f)", s.t, s.x, s.y, s.z)
+end
+
+----------------------------------------------------------------------------------------------- Gelaende
+-- Oberseite eines Blocks: CFrame (UpVector = Normale nach oben, Mitte der Oberseite) und die beiden Kantenlaengen
+local function topOf(p)
+	local cf, s = p.CFrame, p.Size
+	local axes = { { cf.RightVector, s.X }, { cf.UpVector, s.Y }, { cf.LookVector, s.Z } }
+	local bi, bv = 1, -1
+	for i, a in ipairs(axes) do
+		if math.abs(a[1].Y) > bv then bi, bv = i, math.abs(a[1].Y) end
+	end
+	local n = axes[bi][1] * math.sign(axes[bi][1].Y)
+	local center = cf.Position + n * axes[bi][2] / 2
+	local u = axes[(bi % 3) + 1]
+	local v = axes[((bi + 1) % 3) + 1]
+	local vx = u[1]
+	local vz = vx:Cross(n)
+	return CFrame.fromMatrix(center, vx, n, vz), u[2], v[2]
+end
+RS.TopOf = topOf
+
+-- Gelaende, das durch die Haut ragt, absenken (FillBlock Luft knapp ueber der Fahrbahn). opts: { Dry = true, Inset = 1 }
+function RS.CarveTerrain(city, opts)
+	opts = opts or {}
+	local inset = opts.Inset or 1
+	local skin = skinFolder(city, false)
+	assert(skin, "erst RS.Build(" .. city .. ")")
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Include
+	rp.FilterDescendantsInstances = { Workspace.Terrain }
+	local terrain = Workspace.Terrain
+	local backups = folder(folder(ServerStorage, "Backups"), "RoadSmoothTerrain_" .. city)
+	local pieces = skin:GetChildren()
+	local hits, carved, failed = 0, 0, 0
+	local carvedPieces = {}
+	local seq = #backups:GetChildren()
+	for i, p in ipairs(pieces) do
+		if p:IsA("Part") and p.Shape == Enum.PartType.Block then
+			local topCF, e1, e2 = topOf(p)
+			local poke = false
+			local ex, ez = e1 / 2 - inset, e2 / 2 - inset
+			if ex > 0.2 and ez > 0.2 then
+				for _, o in ipairs({ { 0, 0 }, { 0.8, 0.8 }, { -0.8, 0.8 }, { 0.8, -0.8 }, { -0.8, -0.8 } }) do
+					local wp = (topCF * CFrame.new(o[1] * ex, 0, o[2] * ez)).Position
+					local r = Workspace:Raycast(wp + Vector3.new(0, 6, 0), Vector3.new(0, -6.05, 0), rp)
+					if r then poke = true break end
+				end
+			end
+			if poke then
+				hits += 1
+				if not opts.Dry then
+					local cf = topCF * CFrame.new(0, 3.02, 0)
+					local sz = Vector3.new(math.max(0.5, e1 - 2 * inset), 6, math.max(0.5, e2 - 2 * inset))
+					-- Weltbox des abzutragenden Blocks (+1 Voxel) sichern
+					local R, U, L = cf.RightVector, cf.UpVector, cf.LookVector
+					local hh = sz / 2
+					local ext = Vector3.new(
+						math.abs(R.X) * hh.X + math.abs(U.X) * hh.Y + math.abs(L.X) * hh.Z,
+						math.abs(R.Y) * hh.X + math.abs(U.Y) * hh.Y + math.abs(L.Y) * hh.Z,
+						math.abs(R.Z) * hh.X + math.abs(U.Z) * hh.Y + math.abs(L.Z) * hh.Z)
+					local a, b = cf.Position - ext, cf.Position + ext
+					local lo = Vector3int16.new(math.floor(a.X / 4) - 1, math.floor(a.Y / 4) - 1, math.floor(a.Z / 4) - 1)
+					local hi = Vector3int16.new(math.ceil(b.X / 4) + 1, math.ceil(b.Y / 4) + 1, math.ceil(b.Z / 4) + 1)
+					local ok, region = pcall(function() return terrain:CopyRegion(Region3int16.new(lo, hi)) end)
+					if ok and region then
+						seq += 1
+						region.Name = string.format("R%06d", seq)
+						region:SetAttribute("Seq", seq)
+						region:SetAttribute("CornerX", lo.X)
+						region:SetAttribute("CornerY", lo.Y)
+						region:SetAttribute("CornerZ", lo.Z)
+						region.Parent = backups
+						terrain:FillBlock(cf, sz, Enum.Material.Air) -- nur mit Sicherung
+						carved += 1
+						table.insert(carvedPieces, p)
+					else
+						failed += 1
+						warn("RoadSmooth: Gelaende-Sicherung fehlgeschlagen, nicht abgesenkt bei " .. tostring(cf.Position))
+					end
+				end
+			end
+		end
+		if i % 100 == 0 then yield(i / #pieces) end
+	end
+	-- Kontrolle: ragt nach dem Absenken noch Gelaende durch? (FillBlock wirkt auf 4-Stud-Voxel nur anteilig)
+	local still = 0
+	for _, p in ipairs(carvedPieces) do
+		local topCF, e1, e2 = topOf(p)
+		local ex, ez = e1 / 2 - inset, e2 / 2 - inset
+		for _, o in ipairs({ { 0, 0 }, { 0.8, 0.8 }, { -0.8, -0.8 } }) do
+			local wp = (topCF * CFrame.new(o[1] * ex, 0, o[2] * ez)).Position
+			if Workspace:Raycast(wp + Vector3.new(0, 6, 0), Vector3.new(0, -6.05, 0), rp) then still += 1 break end
+		end
+	end
+	setStep("fertig", 1)
+	return string.format("%s: Gelaende ragt an %d Hautplatten durch, %s", city, hits, opts.Dry and "(Probe, nichts geaendert)"
+		or string.format("%d abgesenkt, %d ohne Sicherung uebersprungen, danach ragt noch an %d durch. Sicherung: ServerStorage.Backups.RoadSmoothTerrain_%s", carved, failed, still, city))
+end
+
+function RS.RestoreTerrain(city)
+	local b = ServerStorage:FindFirstChild("Backups")
+	local f = b and b:FindFirstChild("RoadSmoothTerrain_" .. city)
+	assert(f, "keine Gelaende-Sicherung fuer " .. city)
+	local list = f:GetChildren()
+	-- neueste zuerst, damit die aeltesten (urspruenglichen) Daten zuletzt geschrieben werden
+	table.sort(list, function(x, y) return (x:GetAttribute("Seq") or 0) > (y:GetAttribute("Seq") or 0) end)
+	for i, r in ipairs(list) do
+		Workspace.Terrain:PasteRegion(r, Vector3int16.new(r:GetAttribute("CornerX"), r:GetAttribute("CornerY"), r:GetAttribute("CornerZ")), true)
+		if i % 50 == 0 then yield() end
+	end
+	f:Destroy()
+	return string.format("%s: %d Gelaende-Bereiche zurueckgeschrieben (Sicherung verbraucht)", city, #list)
+end
+
+----------------------------------------------------------------------------------------------- Testfahrt (Play-Modus, Server)
+-- Autopilot: setzt die Studio-Testattribute des Sitzes. opts: { Player, City, Lines = Anzahl, Speed = 0..1, Points = {Vector3} }
+function RS.DriveTest(opts)
+	assert(RunService:IsRunning() and RunService:IsServer(), "nur im Play-Modus auf dem Server")
+	opts = opts or {}
+	local pl = opts.Player or Players:GetPlayers()[1]
+	assert(pl and pl.Character, "kein Spieler mit Figur")
+	local hum = pl.Character:FindFirstChildOfClass("Humanoid")
+	local seat, model
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("VehicleSeat") then
+			local m = d:FindFirstAncestorWhichIsA("Model")
+			if m and m:GetAttribute("OwnerId") == pl.UserId then seat, model = d, m break end
+		end
+	end
+	assert(seat and model, "kein eigener LKW gefunden")
+	local root = model.PrimaryPart
+	-- Routen
+	local routes = {}
+	if opts.Points then
+		routes = { opts.Points }
+	else
+		local m = ReplicatedStorage.Modules.NavData:Clone()
+		local nav = require(m)
+		m:Destroy()
+		local city = opts.City or cityOfX(root.Position.X)
+		for _, r in ipairs(nav) do
+			if r.Name == city then
+				local lines = r.Lines
+				local want = opts.Lines or 5
+				for _ = 1, want do
+					local l = lines[math.random(1, #lines)]
+					local P = l.P
+					local pts = {}
+					for k = 1, #P // 3 do table.insert(pts, Vector3.new(P[3 * k - 2], P[3 * k - 1], P[3 * k])) end
+					if math.random() < 0.5 then
+						local rev = {}
+						for i = #pts, 1, -1 do table.insert(rev, pts[i]) end
+						pts = rev
+					end
+					if #pts >= 3 then table.insert(routes, pts) end
+				end
+			end
+		end
+	end
+	local result = { Routes = #routes, Bumps = 0, HardBumps = 0, Airborne = 0, Stuck = 0, MaxVAcc = 0, Spots = {} }
+	local function clearTest()
+		pcall(function()
+			seat:SetAttribute("TestThrottle", nil)
+			seat:SetAttribute("TestSteer", nil)
+			root.Anchored = false
+		end)
+	end
+	local okAll, errAll = pcall(function()
+		for ri, pts in ipairs(routes) do
+			if #pts < 2 then continue end
+			-- Start: Umgebung streamen, LKW an den Routenanfang setzen, Blick zum zweiten Punkt
+			local a, b = pts[1], pts[2]
+			pcall(function() pl:RequestStreamAroundAsync(a, 10) end)
+			root.Anchored = true
+			model:PivotTo(CFrame.lookAt(a + Vector3.new(0, 1.5, 0), Vector3.new(b.X, a.Y + 1.5, b.Z)))
+			task.wait(0.5)
+			root.Anchored = false
+			if seat.Occupant ~= hum then seat:Sit(hum) end
+			task.wait(1.0)
+			pcall(function() root:SetNetworkOwner(pl) end)
+			local settleUntil = os.clock() + 1.5 -- Landung nach dem Versetzen nicht als Stoss werten
+			local idx, slow = 2, 0
+			local lastV, lastT = root.AssemblyLinearVelocity, os.clock()
+			local t0 = os.clock()
+			while idx <= #pts and os.clock() - t0 < 120 do
+				local pos = root.Position
+				local tgt = pts[idx]
+				local to = Vector3.new(tgt.X - pos.X, 0, tgt.Z - pos.Z)
+				local look = root.CFrame.LookVector
+				local fwd = Vector3.new(look.X, 0, look.Z)
+				fwd = (fwd.Magnitude > 1e-3) and fwd.Unit or Vector3.new(0, 0, -1)
+				local dist = to.Magnitude
+				local behind = dist > 1e-3 and fwd:Dot(to.Unit) < -0.2
+				if dist < 8 or (behind and dist < 25 and idx < #pts) then
+					idx += 1 -- erreicht oder schon vorbei: naechster Punkt
+				else
+					local u = to.Unit
+					local ang = math.atan2(fwd:Cross(u).Y, fwd:Dot(u))
+					seat:SetAttribute("TestSteer", math.clamp(-ang * 2.5, -1, 1))
+					local v0 = root.AssemblyLinearVelocity
+					local hv0 = Vector3.new(v0.X, 0, v0.Z).Magnitude
+					local thr = opts.Speed or 1
+					if math.abs(ang) > 0.35 then thr = (hv0 > 18) and -0.6 or 0.35 end -- in Kurven bremsen
+					seat:SetAttribute("TestThrottle", thr)
+				end
+				task.wait(1 / 30)
+				local now = os.clock()
+				local v = root.AssemblyLinearVelocity
+				if now < settleUntil then
+					lastV, lastT = v, now
+				elseif now - lastT >= 0.1 then
+					local ay = (v.Y - lastV.Y) / (now - lastT)
+					local airborne = math.abs(ay + Workspace.Gravity) < 30
+					if airborne then
+						result.Airborne += 1
+					else
+						if math.abs(ay) > math.abs(result.MaxVAcc) then result.MaxVAcc = ay end
+						if math.abs(ay) > 100 then
+							result.Bumps += 1
+							if math.abs(ay) > 300 then result.HardBumps += 1 end
+							if #result.Spots < 200 then table.insert(result.Spots, { x = math.floor(pos.X), y = math.floor(pos.Y * 10) / 10, z = math.floor(pos.Z), a = math.floor(ay) }) end
+						end
+					end
+					lastV, lastT = v, now
+				end
+				local hv = Vector3.new(v.X, 0, v.Z).Magnitude
+				if hv < 3 and (seat:GetAttribute("TestThrottle") or 0) > 0.2 and now > settleUntil + 1 then
+					slow += 1 / 30
+					if slow > 1.5 then
+						result.Stuck += 1
+						table.insert(result.Spots, { x = math.floor(pos.X), y = math.floor(pos.Y * 10) / 10, z = math.floor(pos.Z), a = 0, stuck = true })
+						idx += 1
+						slow = 0
+					end
+				else
+					slow = 0
+				end
+			end
+			seat:SetAttribute("TestThrottle", 0)
+			seat:SetAttribute("TestSteer", 0)
+			task.wait(0.5)
+			status.Progress = ri / #routes
+		end
+	end)
+	clearTest()
+	if not okAll then error(errAll) end
+	RS.LastDrive = result
+	return string.format("Testfahrt: %d Routen | Stoesse >100: %d, >300: %d, max %.0f studs/s² | haengengeblieben: %d", result.Routes, result.Bumps, result.HardBumps, result.MaxVAcc, result.Stuck)
+end
+
+----------------------------------------------------------------------------------------------- Meshes (Optik)
+-- Importierte OBJ-Meshes (Datei > 3D importieren) an ihre Weltbox setzen. Daten: script.MeshData
+local function meshData()
+	local m = script:FindFirstChild("MeshData")
+	assert(m, "MeshData fehlt")
+	local c = m:Clone()
+	c.Parent = m.Parent
+	local d = require(c)
+	c:Destroy()
+	return d
+end
+
+-- 24 Achsdrehungen
+local ROTS = {}
+do
+	local perms = { { 1, 2, 3 }, { 1, 3, 2 }, { 2, 1, 3 }, { 2, 3, 1 }, { 3, 1, 2 }, { 3, 2, 1 } }
+	for _, pm in ipairs(perms) do
+		for _, sx in ipairs({ -1, 1 }) do
+			for _, sy in ipairs({ -1, 1 }) do
+				for _, sz in ipairs({ -1, 1 }) do
+					local m = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } }
+					local sg = { sx, sy, sz }
+					for r = 1, 3 do m[r][pm[r]] = sg[r] end
+					local det = m[1][1] * (m[2][2] * m[3][3] - m[2][3] * m[3][2]) - m[1][2] * (m[2][1] * m[3][3] - m[2][3] * m[3][1])
+						+ m[1][3] * (m[2][1] * m[3][2] - m[2][2] * m[3][1])
+					if det > 0 then table.insert(ROTS, m) end
+				end
+			end
+		end
+	end
+end
+local function rmul(m, v)
+	return Vector3.new(m[1][1] * v.X + m[1][2] * v.Y + m[1][3] * v.Z, m[2][1] * v.X + m[2][2] * v.Y + m[2][3] * v.Z, m[3][1] * v.X + m[3][2] * v.Y + m[3][3] * v.Z)
+end
+local function rcf(m)
+	return CFrame.new(0, 0, 0, m[1][1], m[1][2], m[1][3], m[2][1], m[2][2], m[2][3], m[3][1], m[3][2], m[3][3])
+end
+
+function RS.FindImported(city)
+	local D = meshData()[city]
+	assert(D, "keine Mesh-Daten fuer " .. city)
+	local want = {}
+	for _, o in ipairs(D.objs) do want[o.name] = o end
+	local W = world()
+	local placed = W:FindFirstChild("StrassenMesh2")
+	local found = {}
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("MeshPart") and want[d.Name] and not (placed and d:IsDescendantOf(placed)) then
+			found[d.Name] = found[d.Name] or {}
+			table.insert(found[d.Name], d)
+		end
+	end
+	return found, D
+end
+
+function RS.MeshStatus()
+	local out = {}
+	for _, city in ipairs(RS.CITIES) do
+		local ok, found, D = pcall(RS.FindImported, city)
+		if ok then
+			local n = 0
+			for _ in pairs(found) do n += 1 end
+			local root = world():FindFirstChild("StrassenMesh2")
+			local m = root and root:FindFirstChild(city)
+			table.insert(out, string.format("%s: %d/%d importiert, %d platziert", city, n, #D.objs, m and #m:GetChildren() or 0))
+		end
+	end
+	return table.concat(out, "\n")
+end
+
+-- Meshes platzieren; alte Meshes (StrassenMesh) ins Archiv; alte sichtbare Fahrbahnteile ausblenden
+function RS.PlaceMeshes(city)
+	local found, D = RS.FindImported(city)
+	local list, pp = {}, {}
+	for _, o in ipairs(D.objs) do
+		local arr = found[o.name]
+		if arr then
+			local c = Vector3.new((o.min[1] + o.max[1]) / 2, (o.min[2] + o.max[2]) / 2, (o.min[3] + o.max[3]) / 2)
+			local ext = Vector3.new(o.max[1] - o.min[1], o.max[2] - o.min[2], o.max[3] - o.min[3])
+			table.insert(list, { o = o, mp = arr[1], c = c, ext = ext })
+			table.insert(pp, { c = c, p = arr[1].Position, ext = ext, size = arr[1].Size })
+		end
+	end
+	if #list == 0 then return city .. ": keine importierten Meshes gefunden (Datei > 3D importieren)" end
+	-- Importer-Transformation schaetzen (Drehung aus 24 + Massstab) aus den Mittelpunkten
+	local best
+	if #pp >= 3 then
+		local pm = Vector3.zero
+		for _, e in ipairs(pp) do pm += e.p end
+		pm /= #pp
+		for _, R in ipairs(ROTS) do
+			local qs, qm = {}, Vector3.zero
+			for i, e in ipairs(pp) do qs[i] = rmul(R, e.c); qm += qs[i] end
+			qm /= #pp
+			local num, den = 0, 0
+			for i, e in ipairs(pp) do
+				local a = qs[i] - qm
+				num += a:Dot(e.p - pm)
+				den += a:Dot(a)
+			end
+			local s = den > 0 and num / den or 1
+			if s > 0 then
+				local t = pm - qm * s
+				local err = 0
+				for i, e in ipairs(pp) do err += ((qs[i] * s + t) - e.p).Magnitude ^ 2 end
+				if not best or err < best.err then best = { R = R, s = s, err = math.sqrt(err / #pp) } end
+			end
+		end
+	end
+	if not best then
+		best = { R = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, s = list[1].mp.Size.X / list[1].ext.X, err = -1 }
+	end
+	local Rinv = rcf(best.R):Inverse()
+	local W = world()
+	local root = folder(W, "StrassenMesh2")
+	local m = root:FindFirstChild(city)
+	if not m then
+		m = Instance.new("Model")
+		m.Name = city
+		m.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
+		m.Parent = root
+	end
+	local report = { string.format("%s: %d Meshes, Massstab %.4f, Restfehler %.3f", city, #list, best.s, best.err) }
+	for _, e in ipairs(list) do
+		local mp = e.mp
+		local oldParent = mp.Parent
+		mp.Anchored = true
+		mp.Size = mp.Size / best.s
+		mp.CFrame = CFrame.new(e.c) * (Rinv * mp.CFrame.Rotation)
+		local look = D.look[e.o.cls] or D.look.A
+		mp.Material = Enum.Material[look[1]]
+		mp.Color = Color3.fromHex(look[2])
+		mp.CanCollide = false
+		mp.CanQuery = false
+		mp.CanTouch = false
+		mp.CastShadow = false
+		pcall(function() mp.AudioCanCollide = false end)
+		pcall(function() mp.RenderFidelity = Enum.RenderFidelity.Precise end)
+		pcall(function() mp.CollisionFidelity = Enum.CollisionFidelity.Box end)
+		pcall(function() mp.DoubleSided = false end)
+		for _, ch in ipairs(mp:GetChildren()) do
+			if ch:IsA("SurfaceAppearance") or ch:IsA("Decal") or ch:IsA("Texture") then ch:Destroy() end
+		end
+		mp:SetAttribute("RoadSmoothMesh", true)
+		local prev = m:FindFirstChild(e.o.name)
+		if prev and prev ~= mp then prev:Destroy() end
+		mp.Parent = m
+		-- leere Import-Huellen entfernen
+		while oldParent and oldParent ~= Workspace and oldParent ~= m and (oldParent:IsA("Model") or oldParent:IsA("Folder")) and #oldParent:GetChildren() == 0 do
+			local up = oldParent.Parent
+			oldParent:Destroy()
+			oldParent = up
+		end
+		-- Box pruefen
+		local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = mp.CFrame:GetComponents()
+		local sz = mp.Size
+		local we = Vector3.new(math.abs(r00) * sz.X + math.abs(r01) * sz.Y + math.abs(r02) * sz.Z, math.abs(r10) * sz.X + math.abs(r11) * sz.Y + math.abs(r12) * sz.Z, math.abs(r20) * sz.X + math.abs(r21) * sz.Y + math.abs(r22) * sz.Z)
+		if (we - e.ext).Magnitude > 0.05 + 0.002 * e.ext.Magnitude then
+			table.insert(report, string.format("  WARNUNG %s: Box %s statt %s", e.o.name, tostring(we), tostring(e.ext)))
+		end
+	end
+	-- alle Meshes da? dann alte Optik umschalten
+	local placed = {}
+	for _, ch in ipairs(m:GetChildren()) do placed[ch.Name] = true end
+	local all = true
+	for _, o in ipairs(D.objs) do if not placed[o.name] then all = false end end
+	if all then
+		local old = W:FindFirstChild("StrassenMesh")
+		local oldCity = old and old:FindFirstChild(city)
+		if oldCity then
+			local arch = folder(ServerStorage, "RoadSmoothMeshArchiv")
+			local prev = arch:FindFirstChild(city)
+			if prev then prev:Destroy() end
+			oldCity.Parent = arch
+			table.insert(report, "  alte StrassenMesh-Meshes ins Archiv (ServerStorage.RoadSmoothMeshArchiv)")
+		end
+		local hidden = 0
+		local parts = RS.Collect(city)
+		local under = RS.Under(parts)
+		for _, p in ipairs(parts) do
+			if not under[p] and p.Transparency < 1 and p:GetAttribute("RS_Transparency") == nil then
+				p:SetAttribute("RS_Transparency", p.Transparency)
+				p.Transparency = 1
+				hidden += 1
+			end
+		end
+		local nUnder = 0
+		for _ in pairs(under) do nUnder += 1 end
+		table.insert(report, string.format("  %d bisher sichtbare Fahrbahnteile ausgeblendet, %d Unterfuehrungs-Teile bleiben sichtbar", hidden, nUnder))
+	else
+		table.insert(report, "  noch nicht alle Meshes da - alte Optik bleibt vorerst")
+	end
+	return table.concat(report, "\n")
+end
+
+function RS.RestoreMeshes(city)
+	local W = world()
+	local root = W:FindFirstChild("StrassenMesh2")
+	local m = root and root:FindFirstChild(city)
+	if m then
+		local arch = folder(ServerStorage, "RoadSmoothMeshArchiv")
+		local keep = arch:FindFirstChild(city .. "_neu")
+		if keep then keep:Destroy() end
+		m.Name = city .. "_neu"
+		m.Parent = arch
+	end
+	local arch = ServerStorage:FindFirstChild("RoadSmoothMeshArchiv")
+	local old = arch and arch:FindFirstChild(city)
+	if old then
+		old.Parent = folder(W, "StrassenMesh")
+	end
+	local n = 0
+	for _, p in ipairs(world():GetDescendants()) do
+		if p:IsA("BasePart") and p:GetAttribute("RS_Transparency") ~= nil and cityOfX(p.Position.X) == city then
+			p.Transparency = p:GetAttribute("RS_Transparency")
+			p:SetAttribute("RS_Transparency", nil)
+			n += 1
+		end
+	end
+	return string.format("%s: neue Meshes ins Archiv, alte zurueck, %d Teile wieder sichtbar", city, n)
+end
+
+----------------------------------------------------------------------------------------------- Hintergrund-Jobs
+-- RS.Run("Build", "Neustadt") / RS.Run("Audit", "Neustadt", {Mode="alt"}) ... dann RS.Status() abfragen
+local generation = 0
+local jobThread = nil
+function RS.Run(fname, ...)
+	assert(type(RS[fname]) == "function", "unbekannte Funktion " .. tostring(fname))
+	assert(status.Done, "es laeuft schon: " .. status.Job .. " (haengt er? RS.Reset())")
+	local args = table.pack(...)
+	generation += 1
+	local gen = generation
+	status.Job = fname .. "(" .. tostring(args[1] or "") .. ")"
+	status.Done, status.Error, status.Result = false, nil, nil
+	status.Step, status.Progress = "", 0
+	status.Started = os.clock()
+	jobThread = task.spawn(function()
+		local ok, res = xpcall(RS[fname], debug.traceback, table.unpack(args, 1, args.n))
+		if gen ~= generation then return end -- inzwischen per RS.Reset() abgeloest
+		status.Done = true
+		if ok then status.Result = res else status.Error = tostring(res) end
+	end)
+	return "gestartet: " .. status.Job .. " - Fortschritt mit RS.Status()"
+end
+
+-- Notausgang, falls ein Job haengt (z. B. Play-Modus beendet): alten Job abbrechen und Status freigeben.
+-- Achtung: ein abgebrochener Build/CarveTerrain ist halb fertig -> danach Build bzw. RestoreTerrain erneut ausfuehren.
+function RS.Reset()
+	generation += 1
+	-- alten Job wirklich beenden (sonst laeuft z. B. ein langsamer Build parallel zum naechsten weiter)
+	if jobThread then
+		pcall(task.cancel, jobThread)
+		jobThread = nil
+	end
+	local was = status.Job
+	status.Done, status.Error, status.Result = true, nil, "zurueckgesetzt (vorher: " .. was .. ")"
+	return "Status zurueckgesetzt (vorher: " .. was .. ")"
+end
+
+function RS.Status()
+	local s = status
+	if not s.Done then
+		return string.format("laeuft: %s | %s %.0f%% | %.0fs", s.Job, s.Step, (s.Progress or 0) * 100, os.clock() - s.Started)
+	end
+	if s.Error then return "FEHLER in " .. s.Job .. ": " .. s.Error end
+	return "fertig: " .. s.Job .. "\n" .. tostring(s.Result or "")
+end
+
+function RS.Help()
+	return [[RoadSmooth ]] .. RS.VERSION .. [[ - nahtlose Strassen
+  RS.Groups()                         Kollisionsgruppen anlegen
+  RS.InstallTruck() / UninstallTruck()   neues Fahrwerk (Backup in ServerStorage.ScriptBackups)
+  RS.Run("Audit", stadt, {Mode="alt"|"neu", Vehicle="Van"|"Titan", Sample=0.3})   LKW-genaues Audit
+  RS.Run("Build", stadt) / RS.Restore(stadt)          Fahrhaut bauen / entfernen ({Dry=true} = Probe)
+  RS.Run("CarveTerrain", stadt, {Dry=true})           Gelaende, das durch die Fahrbahn ragt / RS.RestoreTerrain(stadt)
+  RS.Status()                         Fortschritt / Ergebnis des Hintergrund-Jobs
+  RS.Spots(20, "anstoss"|"aufsetzen"|"loch"|"sprung")  schlimmste Stellen,  RS.Look(i) Kamera dorthin
+  RS.Run("DriveTest", {Lines=5})      (nur Play-Modus, Server-Konsole) Autopilot-Testfahrt mit Stossmessung
+  RS.MeshStatus() / RS.Run("PlaceMeshes", stadt) / RS.RestoreMeshes(stadt)   neue Strassen-Optik (OBJ-Import)
+  RS.Reset()                          haengenden Job-Status freigeben
+Staedte: Neustadt, Portavia, Metropolis]]
+end
+
+return RS
+]]></ProtectedString></Properties><Item class="ModuleScript" referent="RBX00000001"><Properties><string name="Name">Core</string><ProtectedString name="Source"><![CDATA[--!native
+-- RoadSmooth.Core: reine Rechenfunktionen (keine Roblox-Typen), damit sie ausserhalb von Studio testbar sind.
+-- Teile werden als Tabellen beschrieben: { k = Form, x, y, z = Mitte, r = {R00..R22} (Zeilen wie CFrame:GetComponents),
+-- sx, sy, sz = Groesse }.  Form k: 0 = Block, 1 = WedgePart, 2 = Zylinder (Achse lokal X), 3 = Kugel.
+-- Welt = Mitte + R * lokal  (R in Zeilen: r[1] r[2] r[3] / r[4] r[5] r[6] / r[7] r[8] r[9]).
+local Core = {}
+
+Core.P = {
+	G = 1, -- Rasterweite (Studs)
+	SIGMA = 2, -- erste Glaettung (Studs)
+	SIGMA2 = 1, -- zweite Glaettung (Studs)
+	LO = 0.4, -- Haut darf hoechstens so weit unter der alten Fahrbahn liegen (grosse Stufen bleiben Rampen)
+	TOL = 0.12, -- maximale Abweichung einer Hautplatte von der glatten Flaeche, sonst teilen
+	MINPIECE = 3, -- kleinste Kantenlaenge beim Teilen (Studs)
+	OVL = 0.25, -- Ueberlappung der Hautplatten (Studs je Seite)
+	THICK = 0.4, -- Dicke der Hautplatten
+	CLOSE = 2, -- Luecken bis 2*CLOSE Studs zwischen Fahrbahnteilen werden geschlossen
+	GAPTOL = 0.08, -- Toleranz der Lueckenkacheln
+	GAPMAX = 8, -- maximale Kantenlaenge einer Lueckenkachel (Studs)
+	STEP = 1, -- Abtastweite auf Teil-Oberseiten
+	UNDER = 3, -- Abtastpunkt gilt als verdeckt, wenn die Flaeche so viel hoeher liegt (Unterfuehrung)
+	GAPSLOPE = 0.4, -- Luecken nur zwischen Fahrbahnen schliessen, deren Hoehe hoechstens so steil auseinanderliegt
+}
+
+local NEG = -1e30
+local abs, floor, ceil, sqrt, max, min, exp = math.abs, math.floor, math.ceil, math.sqrt, math.max, math.min, math.exp
+
+----------------------------------------------------------------------------------------------- Geometrie
+-- Senkrechte Linie (x, z): y-Intervall [lo, hi] innerhalb des Teils oder nil
+function Core.Interval(p, px, pz)
+	local r = p.r
+	local dx, dy, dz = px - p.x, -p.y, pz - p.z
+	-- a = M^T * (dx, dy, dz),  b = M^T * (0, 1, 0)
+	local a1 = r[1] * dx + r[4] * dy + r[7] * dz
+	local a2 = r[2] * dx + r[5] * dy + r[8] * dz
+	local a3 = r[3] * dx + r[6] * dy + r[9] * dz
+	local b1, b2, b3 = r[4], r[5], r[6]
+	local hx, hy, hz = p.sx / 2, p.sy / 2, p.sz / 2
+	local lo, hi = -1e30, 1e30
+	local k = p.k
+	local function slab(a, b, h)
+		if abs(b) < 1e-9 then
+			if abs(a) > h then lo, hi = 1, -1 end
+			return
+		end
+		local t1, t2 = (-h - a) / b, (h - a) / b
+		if t1 > t2 then t1, t2 = t2, t1 end
+		if t1 > lo then lo = t1 end
+		if t2 < hi then hi = t2 end
+	end
+	local function half(na, nb, d) -- na + t*nb <= d
+		if abs(nb) < 1e-9 then
+			if na > d then lo, hi = 1, -1 end
+			return
+		end
+		local t = (d - na) / nb
+		if nb > 0 then
+			if t < hi then hi = t end
+		else
+			if t > lo then lo = t end
+		end
+	end
+	if k == 3 then
+		local rr = min(p.sx, p.sy, p.sz) / 2
+		local B = 2 * (a1 * b1 + a2 * b2 + a3 * b3)
+		local C = a1 * a1 + a2 * a2 + a3 * a3 - rr * rr
+		local disc = B * B - 4 * C
+		if disc < 0 then return nil end
+		local s = sqrt(disc)
+		return (-B - s) / 2, (-B + s) / 2
+	end
+	slab(a1, b1, hx)
+	if k == 2 then
+		local rr = min(p.sy, p.sz) / 2
+		local A = b2 * b2 + b3 * b3
+		local B = 2 * (a2 * b2 + a3 * b3)
+		local C = a2 * a2 + a3 * a3 - rr * rr
+		if A < 1e-9 then
+			if C > 0 then return nil end
+		else
+			local disc = B * B - 4 * A * C
+			if disc < 0 then return nil end
+			local s = sqrt(disc)
+			local t1, t2 = (-B - s) / (2 * A), (-B + s) / (2 * A)
+			if t1 > lo then lo = t1 end
+			if t2 < hi then hi = t2 end
+		end
+	else
+		half(-a2, -b2, hy) -- unten: y >= -hy
+		if k == 1 then
+			local q = p.sy / p.sz -- Schraege: y - q*z <= 0
+			half(a2 - q * a3, b2 - q * b3, 0)
+		else
+			half(a2, b2, hy)
+		end
+		slab(a3, b3, hz)
+	end
+	if lo > hi then return nil end
+	return lo, hi
+end
+
+-- halbe Ausdehnung des Teils in Weltachsen
+function Core.Extents(p)
+	local r = p.r
+	local hx, hy, hz = p.sx / 2, p.sy / 2, p.sz / 2
+	return abs(r[1]) * hx + abs(r[2]) * hy + abs(r[3]) * hz,
+		abs(r[4]) * hx + abs(r[5]) * hy + abs(r[6]) * hz,
+		abs(r[7]) * hx + abs(r[8]) * hy + abs(r[9]) * hz
+end
+
+-- Oberseite: lokale Normale (nx, ny, nz) und Art ("rect" | "tri" | "disc" | "slope")
+function Core.TopFace(p)
+	local r = p.r
+	local function up(lx, ly, lz) return r[4] * lx + r[5] * ly + r[6] * lz end
+	if p.k == 2 then
+		if r[4] >= 0 then return 1, 0, 0, "disc" end
+		return -1, 0, 0, "disc"
+	end
+	if p.k == 1 then
+		local q = p.sy / p.sz
+		local l = sqrt(1 + q * q)
+		local cands = { { 1, 0, 0, "tri" }, { -1, 0, 0, "tri" }, { 0, -1, 0, "rect" }, { 0, 0, 1, "rect" }, { 0, 1 / l, -q / l, "slope" } }
+		local best, bv = nil, -2
+		for _, c in ipairs(cands) do
+			local v = up(c[1], c[2], c[3])
+			if v > bv then best, bv = c, v end
+		end
+		return best[1], best[2], best[3], best[4]
+	end
+	local best, bv = nil, -2
+	for _, c in ipairs({ { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } }) do
+		local v = up(c[1], c[2], c[3])
+		if v > bv then best, bv = c, v end
+	end
+	return best[1], best[2], best[3], "rect"
+end
+
+local function lin(a, b, n) -- n+1 Werte von a bis b
+	local t = {}
+	for i = 0, n do t[i + 1] = a + (b - a) * i / n end
+	return t
+end
+
+-- Abtastpunkte (lokal) auf der Oberseite eines Teils mit Groesse (sx, sy, sz)
+function Core.FaceSamples(k, nx, ny, nz, ft, sx, sy, sz, step)
+	step = step or Core.P.STEP
+	local hx, hy, hz = sx / 2, sy / 2, sz / 2
+	local pts = {}
+	if ft == "disc" then
+		local rr = min(sy, sz) / 2
+		local n = max(2, ceil(rr / step))
+		for _, a in ipairs(lin(-rr, rr, 2 * n)) do
+			for _, b in ipairs(lin(-rr, rr, 2 * n)) do
+				if a * a + b * b <= rr * rr + 1e-9 then table.insert(pts, { nx * hx, a, b }) end
+			end
+		end
+	elseif ft == "tri" then
+		for _, y in ipairs(lin(-hy, hy, max(2, ceil(sy / step)))) do
+			for _, z in ipairs(lin(-hz, hz, max(2, ceil(sz / step)))) do
+				if y <= -hy + sy * (z / sz + 0.5) + 1e-9 then table.insert(pts, { nx * hx, y, z }) end
+			end
+		end
+	elseif ft == "slope" then
+		for _, x in ipairs(lin(-hx, hx, max(2, ceil(sx / step)))) do
+			for _, z in ipairs(lin(-hz, hz, max(2, ceil(sz / step)))) do
+				table.insert(pts, { x, -hy + sy * (z / sz + 0.5), z })
+			end
+		end
+	else
+		local h = { hx, hy, hz }
+		local s = { sx, sy, sz }
+		local nl = { nx, ny, nz }
+		local a = (abs(nx) > 0.5) and 1 or ((abs(ny) > 0.5) and 2 or 3)
+		local u, v = (a == 1) and 2 or 1, (a == 3) and 2 or 3
+		for _, x in ipairs(lin(-h[u], h[u], max(2, ceil(s[u] / step)))) do
+			for _, y in ipairs(lin(-h[v], h[v], max(2, ceil(s[v] / step)))) do
+				local q = { 0, 0, 0 }
+				q[a] = nl[a] * h[a]
+				q[u] = x
+				q[v] = y
+				table.insert(pts, q)
+			end
+		end
+	end
+	return pts
+end
+
+----------------------------------------------------------------------------------------------- Raster
+-- Raster ueber [x0, x0 + nx*G) x [z0, z0 + nz*G)
+function Core.NewGrid(x0, z0, x1, z1, G)
+	G = G or Core.P.G
+	local nx, nz = ceil((x1 - x0) / G), ceil((z1 - z0) / G)
+	local n = nx * nz
+	local g = { x0 = x0, z0 = z0, nx = nx, nz = nz, G = G, n = n }
+	g.top = buffer.create(n * 4) -- f32 hoechste Fahrbahn-Oberkante
+	g.own = buffer.create(n * 4) -- i32 Index des obersten Teils (+1), 0 = leer
+	buffer.fill(g.own, 0, 0)
+	for i = 0, n - 1 do buffer.writef32(g.top, i * 4, NEG) end
+	return g
+end
+
+-- Teil (Index idx) in das Raster schreiben: Zelle = hoechste Oberkante
+function Core.RasterPart(g, p, idx)
+	local ex, _, ez = Core.Extents(p)
+	local G = g.G
+	local i0 = max(0, floor((p.x - ex - g.x0) / G))
+	local i1 = min(g.nx - 1, floor((p.x + ex - g.x0) / G))
+	local k0 = max(0, floor((p.z - ez - g.z0) / G))
+	local k1 = min(g.nz - 1, floor((p.z + ez - g.z0) / G))
+	local n = 0
+	for i = i0, i1 do
+		local x = g.x0 + (i + 0.5) * G
+		for k = k0, k1 do
+			local z = g.z0 + (k + 0.5) * G
+			local lo, hi = Core.Interval(p, x, z)
+			if lo then
+				local o = (k * g.nx + i) * 4
+				if hi > buffer.readf32(g.top, o) then
+					buffer.writef32(g.top, o, hi)
+					buffer.writei32(g.own, o, idx)
+				end
+				n += 1
+			end
+		end
+	end
+	return n
+end
+
+-- maskierte, separierbare Gauss-Glaettung. src/msk: f32 / u8 buffer, nur Zellen mit msk ~= 0 zaehlen.
+-- out: f32 buffer (nur fuer msk ~= 0 gueltig). yieldFn(fortschritt) wird zwischendurch aufgerufen.
+function Core.Blur(g, src, msk, sigma, yieldFn)
+	local G = g.G
+	local s = sigma / G
+	local rad = max(1, ceil(3 * s))
+	local w = {}
+	local sum = 0
+	for d = -rad, rad do
+		local v = exp(-0.5 * (d / s) ^ 2)
+		w[d + rad + 1] = v
+		sum += v
+	end
+	for d = 1, #w do w[d] /= sum end
+	local nx, nz, n = g.nx, g.nz, g.n
+	local num = buffer.create(n * 4)
+	local den = buffer.create(n * 4)
+	-- Pass 1 entlang i (x)
+	for k = 0, nz - 1 do
+		local base = k * nx
+		for i = 0, nx - 1 do
+			local a, b = 0, 0
+			for d = -rad, rad do
+				local ii = i + d
+				if ii >= 0 and ii < nx then
+					local o = base + ii
+					if buffer.readu8(msk, o) ~= 0 then
+						local ww = w[d + rad + 1]
+						a += ww * buffer.readf32(src, o * 4)
+						b += ww
+					end
+				end
+			end
+			buffer.writef32(num, (base + i) * 4, a)
+			buffer.writef32(den, (base + i) * 4, b)
+		end
+		if yieldFn and k % 64 == 0 then yieldFn(0.5 * k / nz) end
+	end
+	-- Pass 2 entlang k (z)
+	local out = buffer.create(n * 4)
+	for k = 0, nz - 1 do
+		for i = 0, nx - 1 do
+			local o = k * nx + i
+			if buffer.readu8(msk, o) ~= 0 then
+				local a, b = 0, 0
+				for d = -rad, rad do
+					local kk = k + d
+					if kk >= 0 and kk < nz then
+						local oo = kk * nx + i
+						local ww = w[d + rad + 1]
+						a += ww * buffer.readf32(num, oo * 4)
+						b += ww * buffer.readf32(den, oo * 4)
+					end
+				end
+				buffer.writef32(out, o * 4, (b > 1e-12) and (a / b) or buffer.readf32(src, o * 4))
+			end
+		end
+		if yieldFn and k % 64 == 0 then yieldFn(0.5 + 0.5 * k / nz) end
+	end
+	return out
+end
+
+-- Maske aus dem Raster: 1 = Fahrbahn
+function Core.Mask(g)
+	local m = buffer.create(g.n)
+	for o = 0, g.n - 1 do
+		if buffer.readi32(g.own, o * 4) ~= 0 then buffer.writeu8(m, o, 1) end
+	end
+	return m
+end
+
+local function dilate(g, m, r, yf)
+	local nx, nz = g.nx, g.nz
+	local out = buffer.create(g.n)
+	local offs = {}
+	for di = -r, r do
+		for dk = -r, r do
+			if di * di + dk * dk <= r * r then table.insert(offs, { di, dk }) end
+		end
+	end
+	for k = 0, nz - 1 do
+		for i = 0, nx - 1 do
+			if buffer.readu8(m, k * nx + i) ~= 0 then
+				for _, d in ipairs(offs) do
+					local ii, kk = i + d[1], k + d[2]
+					if ii >= 0 and kk >= 0 and ii < nx and kk < nz then buffer.writeu8(out, kk * nx + ii, 1) end
+				end
+			end
+		end
+		if yf and k % 128 == 0 then yf() end
+	end
+	return out
+end
+local function invert(g, m)
+	local out = buffer.create(g.n)
+	for o = 0, g.n - 1 do buffer.writeu8(out, o, (buffer.readu8(m, o) == 0) and 1 or 0) end
+	return out
+end
+
+-- Luecken schliessen (morphologisches Schliessen mit Radius r Zellen). Rueckgabe: Maske 1 = Fahrbahn, 2 = Luecke
+function Core.CloseGaps(g, m, r, yf)
+	if r <= 0 then return m end
+	local d = dilate(g, m, r, yf)
+	local e = invert(g, dilate(g, invert(g, d), r, yf))
+	local out = buffer.create(g.n)
+	for o = 0, g.n - 1 do
+		local a = buffer.readu8(m, o)
+		if a ~= 0 then
+			buffer.writeu8(out, o, 1)
+		elseif buffer.readu8(e, o) ~= 0 then
+			buffer.writeu8(out, o, 2)
+		end
+	end
+	return out
+end
+
+-- Glatte Flaeche: blur, nach unten auf (alt - LO) begrenzt, zweiter blur, nochmal begrenzt. Lueckenzellen werden interpoliert.
+function Core.Smooth(g, yieldFn)
+	local P = Core.P
+	local m = Core.Mask(g)
+	local f1 = Core.Blur(g, g.top, m, P.SIGMA, yieldFn and function(t) yieldFn(0.3 * t) end)
+	for o = 0, g.n - 1 do
+		if buffer.readu8(m, o) ~= 0 then
+			local env = buffer.readf32(g.top, o * 4)
+			if buffer.readf32(f1, o * 4) < env - P.LO then buffer.writef32(f1, o * 4, env - P.LO) end
+		end
+	end
+	local f2 = Core.Blur(g, f1, m, P.SIGMA2, yieldFn and function(t) yieldFn(0.3 + 0.3 * t) end)
+	for o = 0, g.n - 1 do
+		if buffer.readu8(m, o) ~= 0 then
+			local env = buffer.readf32(g.top, o * 4)
+			if buffer.readf32(f2, o * 4) < env - P.LO then buffer.writef32(f2, o * 4, env - P.LO) end
+		end
+	end
+	-- Luecken
+	local mc = Core.CloseGaps(g, m, ceil(P.CLOSE / g.G), yieldFn and function() yieldFn(0.6) end)
+	local nx, nz = g.nx, g.nz
+	local rad = ceil(3 * P.SIGMA / g.G)
+	local nGap = 0
+	local maxd = 2 * ceil(P.CLOSE / g.G) + 1
+	local function firstRoad(i, k, di, dk)
+		for d = 1, maxd do
+			local ii, kk = i + di * d, k + dk * d
+			if ii < 0 or kk < 0 or ii >= nx or kk >= nz then return nil end
+			local oo = kk * nx + ii
+			if buffer.readu8(m, oo) ~= 0 then return d, buffer.readf32(f2, oo * 4) end
+		end
+		return nil
+	end
+	for k = 0, nz - 1 do
+		for i = 0, nx - 1 do
+			local o = k * nx + i
+			if buffer.readu8(mc, o) == 2 then
+				-- nur zwischen Fahrbahnen gleicher Ebene schliessen (keine Rampen zwischen Ebenen)
+				local ok = true
+				for _, dir in ipairs({ { 1, 0 }, { 0, 1 }, { 1, 1 }, { 1, -1 } }) do
+					local d1, h1 = firstRoad(i, k, dir[1], dir[2])
+					local d2, h2 = firstRoad(i, k, -dir[1], -dir[2])
+					if d1 and d2 then
+						local run = (d1 + d2) * g.G * ((dir[1] ~= 0 and dir[2] ~= 0) and 1.4142 or 1)
+						if abs(h1 - h2) > P.GAPSLOPE * run + 0.3 then ok = false break end
+					end
+				end
+				local a, b = 0, 0
+				if ok then
+					for kk = max(0, k - rad), min(nz - 1, k + rad) do
+						for ii = max(0, i - rad), min(nx - 1, i + rad) do
+							local oo = kk * nx + ii
+							if buffer.readu8(m, oo) ~= 0 then
+								local d2 = ((ii - i) ^ 2 + (kk - k) ^ 2) * g.G * g.G
+								local ww = exp(-0.5 * d2 / (P.SIGMA * P.SIGMA))
+								a += ww * buffer.readf32(f2, oo * 4)
+								b += ww
+							end
+						end
+					end
+				end
+				if ok and b > 1e-9 then
+					buffer.writef32(f2, o * 4, a / b)
+					nGap += 1
+				else
+					buffer.writeu8(mc, o, 0)
+				end
+			end
+		end
+		if yieldFn and k % 64 == 0 then yieldFn(0.6 + 0.4 * k / nz) end
+	end
+	g.f = f2
+	g.mask = mc
+	g.nGap = nGap
+	return f2, mc
+end
+
+-- Wert der glatten Flaeche an (x, z) oder nil (bilinear ueber die gueltigen Nachbarzellen)
+function Core.FieldAt(g, x, z)
+	local fx, fz = (x - g.x0) / g.G - 0.5, (z - g.z0) / g.G - 0.5
+	local i0, k0 = floor(fx), floor(fz)
+	local tx, tz = fx - i0, fz - k0
+	local s, w = 0, 0
+	for dk = 0, 1 do
+		for di = 0, 1 do
+			local i, k = i0 + di, k0 + dk
+			if i >= 0 and k >= 0 and i < g.nx and k < g.nz then
+				local o = k * g.nx + i
+				if buffer.readu8(g.mask, o) ~= 0 then
+					local ww = ((di == 1) and tx or (1 - tx)) * ((dk == 1) and tz or (1 - tz))
+					s += ww * buffer.readf32(g.f, o * 4)
+					w += ww
+				end
+			end
+		end
+	end
+	if w < 1e-6 then return nil end
+	return s / w
+end
+
+----------------------------------------------------------------------------------------------- Hautplatten
+-- Ebene y = a*x + b*z + c durch Punkte {x, z, y}; Rueckgabe a, b, c, maximaler Fehler
+function Core.PlaneFit(pts)
+	local n = #pts
+	if n < 3 then return nil end
+	local sxx, sxz, szz, sx, sz, sxy, szy, sy = 0, 0, 0, 0, 0, 0, 0, 0
+	-- zentrieren fuer numerische Stabilitaet
+	local mx, mz = 0, 0
+	for _, q in ipairs(pts) do mx += q[1]; mz += q[2] end
+	mx /= n; mz /= n
+	for _, q in ipairs(pts) do
+		local x, z, y = q[1] - mx, q[2] - mz, q[3]
+		sxx += x * x; sxz += x * z; szz += z * z; sx += x; sz += z
+		sxy += x * y; szy += z * y; sy += y
+	end
+	-- Normalgleichungen [sxx sxz sx; sxz szz sz; sx sz n] [a b c'] = [sxy szy sy]
+	-- leichte Regularisierung: bei Punkten auf einer Linie (auch diagonal) bleibt die Steigung entlang der Linie
+	-- erhalten und quer dazu wird sie 0 (statt zufaellig)
+	local lam = 1e-6 * n + 1e-9 * (sxx + szz)
+	local A = { { sxx + lam, sxz, sx, sxy }, { sxz, szz + lam, sz, szy }, { sx, sz, n, sy } }
+	for c = 1, 3 do
+		local piv, pv = c, abs(A[c][c])
+		for r = c + 1, 3 do if abs(A[r][c]) > pv then piv, pv = r, abs(A[r][c]) end end
+		if pv < 1e-12 then
+			-- entartet (z.B. alle Punkte auf einer Linie): nur Mittelwert
+			local yy = 0
+			for _, q in ipairs(pts) do yy += q[3] end
+			yy /= n
+			local e = 0
+			for _, q in ipairs(pts) do e = max(e, abs(q[3] - yy)) end
+			return 0, 0, yy, e
+		end
+		A[c], A[piv] = A[piv], A[c]
+		for r = 1, 3 do
+			if r ~= c then
+				local f = A[r][c] / A[c][c]
+				for cc = c, 4 do A[r][cc] -= f * A[c][cc] end
+			end
+		end
+	end
+	local a, b, cp = A[1][4] / A[1][1], A[2][4] / A[2][2], A[3][4] / A[3][3]
+	local c = cp - a * mx - b * mz
+	local e = 0
+	for _, q in ipairs(pts) do e = max(e, abs(a * q[1] + b * q[2] + c - q[3])) end
+	return a, b, c, e
+end
+
+local function mat(r) return { { r[1], r[2], r[3] }, { r[4], r[5], r[6] }, { r[7], r[8], r[9] } } end
+local function mulv(M, v) -- M (3x3) * v
+	return { M[1][1] * v[1] + M[1][2] * v[2] + M[1][3] * v[3], M[2][1] * v[1] + M[2][2] * v[2] + M[2][3] * v[3], M[3][1] * v[1] + M[3][2] * v[2] + M[3][3] * v[3] }
+end
+local function mulm(A, B)
+	local C = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } }
+	for i = 1, 3 do for j = 1, 3 do C[i][j] = A[i][1] * B[1][j] + A[i][2] * B[2][j] + A[i][3] * B[3][j] end end
+	return C
+end
+local function unit(v)
+	local l = sqrt(v[1] ^ 2 + v[2] ^ 2 + v[3] ^ 2)
+	return { v[1] / l, v[2] / l, v[3] / l }
+end
+local function cross(a, b) return { a[2] * b[3] - a[3] * b[2], a[3] * b[1] - a[1] * b[3], a[1] * b[2] - a[2] * b[1] } end
+local function dot(a, b) return a[1] * b[1] + a[2] * b[2] + a[3] * b[3] end
+-- Rotation, die a auf b dreht (Rodrigues)
+local function rotBetween(a, b)
+	a, b = unit(a), unit(b)
+	local v = cross(a, b)
+	local c = dot(a, b)
+	local s = sqrt(dot(v, v))
+	if s < 1e-9 then
+		if c > 0 then return { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } } end
+		return { { -1, 0, 0 }, { 0, -1, 0 }, { 0, 0, -1 } }
+	end
+	local vx = { { 0, -v[3], v[2] }, { v[3], 0, -v[1] }, { -v[2], v[1], 0 } }
+	local vx2 = mulm(vx, vx)
+	local f = (1 - c) / (s * s)
+	local R = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }
+	for i = 1, 3 do for j = 1, 3 do R[i][j] += vx[i][j] + vx2[i][j] * f end end
+	return R
+end
+local function flat(M) return { M[1][1], M[1][2], M[1][3], M[2][1], M[2][2], M[2][3], M[3][1], M[3][2], M[3][3] } end
+local function sgn(x) return (x < 0) and -1 or 1 end
+
+-- Hautplatte: Teil (Mitte c, Drehung M, Groesse s) so drehen/verschieben, dass seine Oberseite auf y = a x + b z + cc liegt
+function Core.MakePiece(k, M, c, s, nl, ft, a, b, cc)
+	local P = Core.P
+	local nNew = unit({ -a, 1, -b })
+	local nOld = unit(mulv(M, nl))
+	local M2 = mulm(rotBetween(nOld, nNew), M)
+	local kind = k
+	local s2 = { s[1], s[2], s[3] }
+	local ax
+	local nl2 = { nl[1], nl[2], nl[3] }
+	if ft == "slope" then
+		-- Keil mit schraeger Oberseite -> flacher Block ueber derselben Grundflaeche
+		local L = sqrt(s[2] ^ 2 + s[3] ^ 2)
+		local zdir = mulv(M2, { 0, s[2] / L, s[3] / L })
+		local d = dot(zdir, nNew)
+		zdir = unit({ zdir[1] - nNew[1] * d, zdir[2] - nNew[2] * d, zdir[3] - nNew[3] * d })
+		local xdir = cross(nNew, zdir)
+		M2 = { { xdir[1], nNew[1], zdir[1] }, { xdir[2], nNew[2], zdir[2] }, { xdir[3], nNew[3], zdir[3] } }
+		s2 = { s[1], P.THICK, L }
+		nl2 = { 0, 1, 0 }
+		ax = 2
+		kind = 0
+	elseif ft == "disc" or ft == "tri" then
+		ax = 1
+	else
+		ax = (abs(nl[1]) > 0.5) and 1 or ((abs(nl[2]) > 0.5) and 2 or 3)
+	end
+	-- Mitte der Oberseite im ORIGINAL-Teil (Drehung erfolgt um diesen Punkt, damit dicke Teile nicht seitlich wandern)
+	local top
+	if ft == "slope" then
+		top = { c[1], c[2], c[3] } -- die Schraege geht durch die lokale Mitte
+	else
+		local h0 = { s[1] / 2, s[2] / 2, s[3] / 2 }
+		local tl = { 0, 0, 0 }
+		tl[ax] = sgn(nl[ax]) * h0[ax]
+		if ft == "tri" then
+			tl[2] = -h0[2] / 3
+			tl[3] = h0[3] / 3
+		end
+		local tw = mulv(M, tl)
+		top = { c[1] + tw[1], c[2] + tw[2], c[3] + tw[3] }
+	end
+	top[2] = a * top[1] + b * top[3] + cc
+	local s3 = { s2[1], s2[2], s2[3] }
+	s3[ax] = P.THICK
+	for i = 1, 3 do if i ~= ax then s3[i] += 2 * P.OVL end end
+	if kind == 2 then
+		local d = min(s3[2], s3[3])
+		s3[2], s3[3] = d, d
+	end
+	local rel = { 0, 0, 0 }
+	rel[ax] = sgn(nl2[ax]) * P.THICK / 2
+	if ft == "tri" then
+		rel[2] = -s3[2] / 6
+		rel[3] = s3[3] / 6
+	end
+	local rw = mulv(M2, rel)
+	return { k = kind, x = top[1] - rw[1], y = top[2] - rw[2], z = top[3] - rw[3], r = flat(M2), sx = s3[1], sy = s3[2], sz = s3[3] }
+end
+
+-- Hautplatten fuer ein Fahrbahnteil (geteilt, falls die glatte Flaeche nicht eben genug ist)
+function Core.PiecesFor(g, p)
+	local P = Core.P
+	local nx, ny, nz, ft = Core.TopFace(p)
+	local M = mat(p.r)
+	local nl = { nx, ny, nz }
+	local upc = mulv(M, nl)[2]
+	if upc < 0.5 then return {}, "steil" end
+	local covered = 0
+	local function samplesWorld(cx, cy, cz, sx, sy, sz)
+		local loc = Core.FaceSamples(p.k, nx, ny, nz, ft, sx, sy, sz)
+		local out = {}
+		for _, q in ipairs(loc) do
+			local w = mulv(M, q)
+			local x, z = cx + w[1], cz + w[3]
+			local f = Core.FieldAt(g, x, z)
+			if f then
+				-- liegt die glatte Flaeche hier deutlich hoeher (andere Ebene darueber), gehoert der Punkt nicht zu diesem Teil
+				if f - (cy + w[2]) < P.UNDER then
+					table.insert(out, { x, z, f })
+				else
+					covered += 1
+				end
+			end
+		end
+		return out
+	end
+	local subs = { { p.x, p.y, p.z, p.sx, p.sy, p.sz } }
+	if ft == "rect" and p.k == 0 then
+		-- rekursiv halbieren (laengere Kante zuerst), bis die Ebene passt oder das Stueck klein ist
+		local a = (abs(nx) > 0.5) and 1 or ((abs(ny) > 0.5) and 2 or 3)
+		local u, v = (a == 1) and 2 or 1, (a == 3) and 2 or 3
+		subs = {}
+		local nSplit = 0
+		local function rec(cx, cy, cz, s, depth)
+			local pts = samplesWorld(cx, cy, cz, s[1], s[2], s[3])
+			if #pts < 3 then return end
+			local _, _, _, err = Core.PlaneFit(pts)
+			local longAx = (s[u] >= s[v]) and u or v
+			if err > P.TOL and s[longAx] > P.MINPIECE * 2 and depth < 14 then
+				nSplit += 1
+				local half = { s[1], s[2], s[3] }
+				half[longAx] = s[longAx] / 2
+				for _, sg in ipairs({ -1, 1 }) do
+					local off = { 0, 0, 0 }
+					off[longAx] = sg * s[longAx] / 4
+					local w = mulv(M, off)
+					rec(cx + w[1], cy + w[2], cz + w[3], half, depth + 1)
+				end
+			else
+				table.insert(subs, { cx, cy, cz, s[1], s[2], s[3] })
+			end
+		end
+		rec(p.x, p.y, p.z, { p.sx, p.sy, p.sz }, 0)
+		if #subs == 0 then return {}, "keinFeld" end
+	end
+	local out = {}
+	local rejected = 0
+	for _, sb in ipairs(subs) do
+		local pts = samplesWorld(sb[1], sb[2], sb[3], sb[4], sb[5], sb[6])
+		if #pts >= 3 then
+			local a, b, c, err = Core.PlaneFit(pts)
+			local up = 1 / sqrt(1 + a * a + b * b)
+			-- keine steilen oder schlecht passenden Platten (z.B. an der Kante einer darueberliegenden Ebene)
+			if err <= 0.5 and up >= min(upc, 0.9) - 0.1 then
+				local pc = Core.MakePiece(p.k == 3 and 0 or p.k, M, { sb[1], sb[2], sb[3] }, { sb[4], sb[5], sb[6] }, nl, ft, a, b, c)
+				pc.err = err
+				table.insert(out, pc)
+			else
+				rejected += 1
+			end
+		end
+	end
+	if covered > 0 or rejected > 0 then return out, "unter" end
+	return out, (#subs > 1) and "geteilt" or "ok"
+end
+
+-- Kacheln fuer geschlossene Luecken (Maskenwert 2): achsparallele Quadtree-Kacheln, je eine Ebene
+function Core.GapPieces(g)
+	local P = Core.P
+	local nx, nz, G = g.nx, g.nz, g.G
+	local seen = buffer.create(g.n)
+	local out = {}
+	local maxc = max(1, floor(P.GAPMAX / G))
+	local function tile(i0, k0, ni, nk)
+		-- Ebene ueber alle Zellen (Fahrbahn + Luecke) im Rechteck, gefittet an Lueckenzellen und Nachbarn
+		local pts = {}
+		for i = i0, i0 + ni - 1 do
+			for k = k0, k0 + nk - 1 do
+				local o = k * nx + i
+				if buffer.readu8(g.mask, o) ~= 0 then
+					table.insert(pts, { g.x0 + (i + 0.5) * G, g.z0 + (k + 0.5) * G, buffer.readf32(g.f, o * 4) })
+				end
+			end
+		end
+		if #pts < 3 then
+			if #pts == 0 then return end
+			local y = pts[1][3]
+			pts = { { pts[1][1] - 0.1, pts[1][2], y }, { pts[1][1] + 0.1, pts[1][2], y }, { pts[1][1], pts[1][2] + 0.1, y } }
+		end
+		local a, b, c, err = Core.PlaneFit(pts)
+		if err > P.GAPTOL and (ni > 1 or nk > 1) then
+			if ni >= nk then
+				local h = floor(ni / 2)
+				tile(i0, k0, h, nk)
+				tile(i0 + h, k0, ni - h, nk)
+			else
+				local h = floor(nk / 2)
+				tile(i0, k0, ni, h)
+				tile(i0, k0 + h, ni, nk - h)
+			end
+			return
+		end
+		local cx = g.x0 + (i0 + ni / 2) * G
+		local cz = g.z0 + (k0 + nk / 2) * G
+		local sx, sz = ni * G, nk * G
+		local pc = Core.MakePiece(0, { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { cx, a * cx + b * cz + c - 0.5, cz }, { sx, 1, sz }, { 0, 1, 0 }, "rect", a, b, c)
+		pc.err = err
+		pc.gap = true
+		table.insert(out, pc)
+	end
+	for k = 0, nz - 1 do
+		for i = 0, nx - 1 do
+			local o = k * nx + i
+			if buffer.readu8(g.mask, o) == 2 and buffer.readu8(seen, o) == 0 then
+				-- Rechteck um zusammenhaengende Lueckenzellen in diesem Block wachsen lassen
+				local i1, k1 = i, k
+				while i1 + 1 < nx and i1 - i + 1 < maxc and buffer.readu8(g.mask, k * nx + i1 + 1) == 2 and buffer.readu8(seen, k * nx + i1 + 1) == 0 do
+					i1 += 1
+				end
+				local grow = true
+				while grow and k1 + 1 < nz and k1 - k + 1 < maxc do
+					for ii = i, i1 do
+						local oo = (k1 + 1) * nx + ii
+						if buffer.readu8(g.mask, oo) ~= 2 or buffer.readu8(seen, oo) ~= 0 then grow = false break end
+					end
+					if grow then k1 += 1 end
+				end
+				for kk = k, k1 do for ii = i, i1 do buffer.writeu8(seen, kk * nx + ii, 1) end end
+				tile(i, k, i1 - i + 1, k1 - k + 1)
+			end
+		end
+	end
+	return out
+end
+
+----------------------------------------------------------------------------------------------- Fahrt-Kennzahlen
+-- Aus einer Folge von Zielhoehen (gleicher Abstand) Spruenge bestimmen: |dh - erwartet| > thr
+function Core.Jumps(seq, thr, n)
+	local out = {}
+	n = n or #seq
+	for i = 2, n do
+		local a, b = seq[i - 1], seq[i]
+		if a and b then
+			local d = b - a
+			local pr = {}
+			if i > 2 and seq[i - 2] then table.insert(pr, seq[i - 1] - seq[i - 2]) end
+			if i < n and seq[i + 1] then table.insert(pr, seq[i + 1] - seq[i]) end
+			local pred = 0
+			if #pr == 2 then
+				-- der kleinere Nachbar-Anstieg ist die erwartete Steigung (sonst wird eine Stufe dreimal gezaehlt)
+				pred = (abs(pr[1]) <= abs(pr[2])) and pr[1] or pr[2]
+			elseif #pr == 1 then
+				pred = pr[1]
+			end
+			pred = math.clamp(pred, -0.5, 0.5)
+			local j = d - pred
+			if abs(j) > thr then table.insert(out, { i = i, j = j }) end
+		end
+	end
+	return out
+end
+
+-- Hoehenfilter des neuen Fahrwerks (alpha-beta): folgt Steigungen ohne Verzug, glaettet Spruenge
+function Core.NewFilter(alpha, beta)
+	return { y = nil, v = 0, a = alpha or 0.3, b = beta or 0.05 }
+end
+function Core.FilterStep(F, raw, dt, minY)
+	if F.y == nil then
+		F.y, F.v = raw, 0
+	else
+		local pred = F.y + F.v * dt
+		local res = raw - pred
+		F.y = pred + F.a * res
+		F.v = F.v + F.b * res / math.max(dt, 1e-4)
+	end
+	if minY and F.y < minY then
+		F.y = minY
+		if F.v < 0 then F.v = 0 end
+	end
+	return F.y
+end
+
+return Core
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000002"><Properties><string name="Name">TruckNeu</string><ProtectedString name="Source"><![CDATA[-- Truck: Arcade-Fahrwerk für den eigenen LKW (Raycast-Bodenfolge, Gas/Lenkung über VehicleSeat), Tacho
+-- [RoadSmooth] Fahrwerk v2:
+--   * Bodenstrahlen ignorieren Teile ohne Kollision (Markierungen, Trigger, Marker, Deko-Meshes) und nutzen die
+--     Kollisionsgruppe "TruckRay" (sieht die glatte Fahrhaut statt der alten Fahrbahn-Abschnitte).
+--   * Hoehe wird mit einem Alpha-Beta-Filter geglaettet: folgt Steigungen ohne Verzug, kleine Kanten werden weich.
+--   * Vorausschau-Strahlen an der Stossstange heben den LKW rechtzeitig an, statt gegen Kanten zu fahren
+--     (nur flache Fahrbahn-/Gelaende-Stufen, stetig bis MAX_LIFT; Waende, Fahrzeuge, Gegenstaende bleiben Hindernisse).
+--   * Mindesthoehe rechnet mit dem geneigten Kasten (Hang, Kuppe), nicht mit einem waagrechten.
+--   * Neigung (Up-Vektor) wird weich nachgefuehrt.
+--   * Fehlt die Fahrhaut an einer Stelle (Streaming, noch nicht gebaut), sehen die Strahlen die alte Fahrbahn.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local PhysicsService = game:GetService("PhysicsService")
+local RS = game:GetService("ReplicatedStorage")
+local U = require(RS.Modules.Util)
+
+local Tr = {}
+local UI, T
+local player = Players.LocalPlayer
+local active
+
+-- Fahrwerks-Einstellungen
+local ALPHA = 0.2 -- Hoehenfilter: Anteil der Abweichung, der je Frame (60 fps) uebernommen wird
+local BETA = 0.03 -- Hoehenfilter: Anpassung der Steiggeschwindigkeit
+local CLEAR = 0.25 -- Mindestabstand Kasten-Unterkante ueber dem hoechsten Bodenpunkt (Studs)
+local SAG = 0.6 -- so weit darf die gefilterte Hoehe unter der gemessenen liegen (Studs)
+local UP_RATE = 10 -- Nachfuehrung der Neigung (1/s)
+local LOOKAHEAD = 0.18 -- Sekunden Vorausschau fuer die Stossstangen-Strahlen
+local MAX_LIFT = 1.0 -- Vorausschau/Mitte: hoechstens so viel zusaetzliches Anheben (hoehere Stufen = Hindernis, Kasten stoesst an)
+local RAMP = 0.25 -- Vorausschau: Steigung, die der Kasten durch Kippen selbst schafft (wird ab der Stossstange abgezogen)
+-- Vorausschau zaehlt nur Fahrbahn: Fahrhaut, Gelaende und diese Fahrbahnteile (alles andere = Hindernis)
+local ROADNAMES = {
+	Road = true, RoadFill = true, RoadRamp = true, SlitFill = true, RoadBevel = true, Asphalt = true, Joint = true,
+	JointSquare = true, Lane = true, LaneJoint = true, LaneLink = true, TurnCircle = true, EndCap = true, Deck = true,
+	Track = true, Yard = true,
+}
+local FLOAT = 0.6 -- gefilterte Hoehe hoechstens so weit ueber der gemessenen (kein Nachschweben nach Kuppen)
+
+local function groupExists(name)
+	local ok, res = pcall(function() return PhysicsService:IsCollisionGroupRegistered(name) end)
+	return ok and res
+end
+
+local function stop()
+	if not active then return end
+	for _, x in ipairs(active.Objects) do x:Destroy() end
+	if active.Conn then active.Conn:Disconnect() end
+	if active.Gui then active.Gui.Visible = false end
+	active = nil
+end
+
+local function start(seat, model)
+	stop()
+	local root = model.PrimaryPart
+	if not root then return end
+	local objs = {}
+	local att = Instance.new("Attachment")
+	att.Name = "DriveAtt"
+	att.Parent = root
+	table.insert(objs, att)
+	local lv = Instance.new("LinearVelocity")
+	lv.Attachment0 = att
+	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+	lv.PrimaryTangentAxis = Vector3.new(1, 0, 0)
+	lv.SecondaryTangentAxis = Vector3.new(0, 0, 1)
+	lv.RelativeTo = Enum.ActuatorRelativeTo.World
+	lv.MaxForce = root.AssemblyMass * 220
+	lv.Parent = root
+	table.insert(objs, lv)
+	local ap = Instance.new("AlignPosition")
+	ap.Mode = Enum.PositionAlignmentMode.OneAttachment
+	ap.Attachment0 = att
+	ap.ForceLimitMode = Enum.ForceLimitMode.PerAxis
+	ap.MaxAxesForce = Vector3.new(0, root.AssemblyMass * 400, 0)
+	ap.Responsiveness = 25
+	ap.MaxVelocity = 60
+	ap.Position = root.Position
+	ap.Parent = root
+	table.insert(objs, ap)
+	local ao = Instance.new("AlignOrientation")
+	ao.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	ao.Attachment0 = att
+	ao.MaxTorque = math.huge
+	ao.Responsiveness = 30
+	ao.CFrame = root.CFrame.Rotation
+	ao.Parent = root
+	table.insert(objs, ao)
+	-- Fahrwerks-Ecken aus den Rädern
+	local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and d:GetAttribute("Wheel") then
+			local lp = root.CFrame:PointToObjectSpace(d.Position)
+			minX, maxX = math.min(minX, lp.X), math.max(maxX, lp.X)
+			minZ, maxZ = math.min(minZ, lp.Z), math.max(maxZ, lp.Z)
+		end
+	end
+	if minX == math.huge then minX, maxX, minZ, maxZ = -3, 3, -6, 6 end
+	local corners = { Vector3.new(minX, 0, minZ), Vector3.new(maxX, 0, minZ), Vector3.new(minX, 0, maxZ), Vector3.new(maxX, 0, maxZ) }
+	local pivotOff = root.CFrame:ToObjectSpace(model:GetPivot())
+	local ride = -pivotOff.Position.Y
+	-- Kasten (Kollision): halbe Laenge/Breite und Bodenfreiheit
+	local halfL, halfW, halfH = root.Size.Z / 2, root.Size.X / 2, root.Size.Y / 2
+	local maxSpeed = (model:GetAttribute("MaxSpeed") or 44) * 1.25
+	local accel = (model:GetAttribute("Accel") or 14) * 1.3
+	local turn = model:GetAttribute("Turn") or 1
+	local speed = 0
+	local _, yaw = root.CFrame:ToEulerAnglesYXZ()
+	local useSkin = groupExists("TruckRay")
+	-- Bodenstrahlen: sehen die Fahrhaut (TruckRay), nicht die alten Abschnitte
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.RespectCanCollide = true
+	if useSkin then params.CollisionGroup = "TruckRay" end
+	-- Rueckfall: normale Gruppe, sieht die alte Fahrbahn (falls dort keine Haut ist)
+	local baseParams = RaycastParams.new()
+	baseParams.FilterType = Enum.RaycastFilterType.Exclude
+	baseParams.RespectCanCollide = true
+	local skin = nil -- workspace.World.FahrHaut
+	local function refreshFilter()
+		local list = { model }
+		for _, p in ipairs(Players:GetPlayers()) do if p.Character then table.insert(list, p.Character) end end
+		local g = workspace:FindFirstChild("ClientGhosts")
+		if g then table.insert(list, g) end
+		local world = workspace:FindFirstChild("World")
+		local veh = world and world:FindFirstChild("Vehicles")
+		if veh then table.insert(list, veh) end
+		params.FilterDescendantsInstances = list
+		baseParams.FilterDescendantsInstances = list
+		skin = world and world:FindFirstChild("FahrHaut")
+	end
+	refreshFilter()
+	local gui = Tr.Gui
+	gui.Visible = true
+	active = { Objects = objs, Gui = gui }
+	local tick = 0
+	local lastPos = root.Position
+	local studio = RunService:IsStudio()
+	-- Filterzustand
+	local fy, fv = nil, 0 -- gefilterte Bodenhoehe und deren Aenderungsrate
+	local upF = root.CFrame.UpVector
+	local DOWN = Vector3.new(0, -40, 0)
+	local function cast(wp)
+		local o = wp + Vector3.new(0, 6, 0)
+		local hit = workspace:Raycast(o, DOWN, params)
+		if useSkin and not (hit and hit.Instance.CollisionGroup == "RoadSkin") then
+			-- keine Haut getroffen: liegt die alte Fahrbahn hoeher? (Haut fehlt hier) -> die nehmen
+			local b = workspace:Raycast(o, DOWN, baseParams)
+			if b and (not hit or b.Position.Y > hit.Position.Y + 0.4) then hit = b end
+		end
+		return hit
+	end
+	-- Vorausschau-Strahl: von knapp ueber der hoechsten noch befahrbaren Stufe nach unten (hoeher = unsichtbar)
+	-- (base = Hoehe der Bodenebene unter den Raedern, bis zu dieser Stelle verlaengert, plus Rampen-Toleranz)
+	local function castAhead(wp, base)
+		local top = base + (ride - halfH) + MAX_LIFT + 1.5
+		local h = workspace:Raycast(Vector3.new(wp.X, top, wp.Z), DOWN, params)
+		if not h then return nil end
+		local inst = h.Instance
+		-- nur Fahrbahn zaehlt: Haut, Gelaende, Fahrbahnteile ohne Haut (Unterfuehrung, Teilabdeckung)
+		if inst == workspace.Terrain or ROADNAMES[inst.Name] or (skin and inst:IsDescendantOf(skin)) then return h end
+		return nil
+	end
+	active.Conn = RunService.Heartbeat:Connect(function(dt)
+		if not seat.Parent or seat.Occupant == nil or not root.Parent then stop() return end
+		tick += dt
+		if tick > 2 then tick = 0 refreshFilter() end
+		-- vom Server versetzt (Autobahn-Reise, Heimfahrt)? Ausrichtung übernehmen, Tempo zurücksetzen
+		local now = root.Position
+		if (now - lastPos).Magnitude > 30 then
+			local _, y = root.CFrame:ToEulerAnglesYXZ()
+			yaw = y
+			speed = 0
+			ap.Position = now
+			fy, fv = nil, 0
+			upF = root.CFrame.UpVector
+		end
+		lastPos = now
+		local throttle, steer = seat.ThrottleFloat, seat.SteerFloat
+		if studio and seat:GetAttribute("TestThrottle") then
+			-- nur in Studio: automatisierte Fahrtests
+			throttle = seat:GetAttribute("TestThrottle")
+			steer = seat:GetAttribute("TestSteer") or 0
+		end
+		-- Geschwindigkeit
+		if throttle > 0 then
+			speed += (speed < 0 and accel * 2.5 or accel) * throttle * dt
+		elseif throttle < 0 then
+			speed += (speed > 0 and accel * 2.8 or accel * 0.7) * throttle * dt
+		else
+			local drag = accel * 0.6 * dt
+			if math.abs(speed) <= drag then speed = 0 else speed -= drag * math.sign(speed) end
+		end
+		speed = math.clamp(speed, -maxSpeed * 0.35, maxSpeed)
+		-- Lenkung (abhängig vom Tempo)
+		local sf = math.clamp(math.abs(speed) / 14, 0, 1) * math.sign(speed)
+		yaw -= steer * turn * sf * dt
+		-- Boden abtasten
+		local rc = root.CFrame
+		local flatCF = CFrame.new(rc.Position) * CFrame.Angles(0, yaw, 0)
+		local pts, n = {}, 0
+		for _, c in ipairs(corners) do
+			local h = cast(flatCF * c)
+			if h then
+				n += 1
+				pts[#pts + 1] = h.Position
+			else
+				pts[#pts + 1] = false
+			end
+		end
+		local fwd = Vector3.new(-math.sin(yaw), 0, -math.cos(yaw))
+		if n >= 3 then
+			local sum = Vector3.zero
+			for _, p in ipairs(pts) do if p then sum += p end end
+			local avg = sum / n
+			local fl, fr, rl, rr = pts[1] or avg, pts[2] or avg, pts[3] or avg, pts[4] or avg
+			local front, rear = (fl + fr) / 2, (rl + rr) / 2
+			local left, right = (fl + rl) / 2, (fr + rr) / 2
+			local f = (front - rear)
+			local r = (right - left)
+			local up = r:Cross(f)
+			if up.Y < 0 then up = -up end
+			up = (up.Magnitude > 0.01) and up.Unit or Vector3.yAxis
+			if up.Y < 0.6 then up = Vector3.yAxis end
+			-- Hoehenfilter (Alpha-Beta): Steigungen ohne Verzug, Kanten weich
+			local raw = avg.Y
+			local k = math.clamp(dt * 60, 0.25, 4)
+			if fy == nil then
+				fy, fv = raw, 0
+			else
+				local pred = fy + fv * dt
+				local res = raw - pred
+				fy = pred + math.min(1, ALPHA * k) * res
+				fv = fv + math.min(1, BETA * k) * res / math.max(dt, 1e-3)
+			end
+			-- Neigung weich nachfuehren (vor den Grenzen: die rechnen mit der Ziel-Neigung)
+			upF = upF:Lerp(up, 1 - math.exp(-UP_RATE * dt))
+			upF = (upF.Magnitude > 0.01) and upF.Unit or Vector3.yAxis
+			-- Obergrenze: nicht ueber Kuppen hinaus schweben
+			if fy > raw + FLOAT then
+				fy = raw + FLOAT
+				if fv > 0 then fv = 0 end
+			end
+			-- Untergrenze: Unterkante des GENEIGTEN Kastens (Ziel- und Ist-Neigung) ueber dem Bodenpunkt hp mindestens CLEAR
+			local cx, cz = rc.Position.X, rc.Position.Z
+			local ru = rc.UpVector
+			local function need(hp)
+				local dx, dz = hp.X - cx, hp.Z - cz
+				local a = (halfH + upF.X * dx + upF.Z * dz) / math.max(upF.Y, 0.6)
+				local b = (halfH + ru.X * dx + ru.Z * dz) / math.max(ru.Y, 0.6)
+				return hp.Y + CLEAR + math.max(a, b) - ride
+			end
+			local lb = raw - SAG
+			for _, p in ipairs(pts) do
+				if p then lb = math.max(lb, need(p)) end
+			end
+			-- Mitte (Kuppe zwischen den Achsen) und Vorausschau (Stufe vor der Stossstange): nur flache Flaechen,
+			-- Anheben stetig auf MAX_LIFT begrenzt (kein Ein/Aus-Sprung)
+			local function consider(h, minus)
+				if h and h.Normal.Y > 0.8 then
+					lb = math.max(lb, math.min(need(h.Position) - minus, raw + MAX_LIFT))
+				end
+			end
+			consider(cast(flatCF.Position), 0)
+			if math.abs(speed) > 1 then
+				local dir = (speed > 0) and -1 or 1 -- lokal -Z = vorne
+				local ahead = halfL + math.clamp(math.abs(speed) * LOOKAHEAD, 1, 10)
+				local tol = RAMP * (ahead - halfL) -- sanfte Rampen schafft der Kasten durch Kippen
+				for _, sx in ipairs({ -halfW + 0.3, 0, halfW - 0.3 }) do
+					local wp = flatCF * Vector3.new(sx, 0, dir * ahead)
+					local base = avg.Y - (up.X * (wp.X - avg.X) + up.Z * (wp.Z - avg.Z)) / up.Y
+					consider(castAhead(wp, base + tol), tol)
+				end
+			end
+			if fy < lb then
+				fy = lb
+				if fv < 0 then fv = 0 end
+			end
+			ap.Enabled = true
+			ap.Position = Vector3.new(rc.Position.X, fy + ride, rc.Position.Z)
+			local look = (fwd - upF * fwd:Dot(upF)).Unit
+			ao.CFrame = CFrame.lookAt(Vector3.zero, look, upF)
+			lv.MaxForce = root.AssemblyMass * 220
+			lv.PlaneVelocity = Vector2.new(fwd.X * speed, fwd.Z * speed)
+		else
+			fy, fv = nil, 0
+			ap.Enabled = false
+			upF = Vector3.yAxis
+			ao.CFrame = CFrame.lookAt(Vector3.zero, fwd, Vector3.yAxis)
+			lv.MaxForce = root.AssemblyMass * 20
+			lv.PlaneVelocity = Vector2.new(fwd.X * speed, fwd.Z * speed)
+		end
+		-- gegen Hindernis gefahren? Tempo an echte Geschwindigkeit angleichen
+		local real = root.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+		if math.abs(speed) > 6 and real.Magnitude < math.abs(speed) * 0.35 then
+			speed *= 0.92
+		end
+		Tr.SpeedText.Text = tostring(math.floor(math.abs(speed) * 1.6)) .. ""
+	end)
+end
+
+function Tr.Init(ui)
+	UI, T = ui, ui.T
+	local g = UI.Panel(UI.HUD, { Name = "Speedo", Size = UDim2.fromOffset(170, 70), Position = UDim2.new(1, -16, 1, -96), AnchorPoint = Vector2.new(1, 1), Visible = false })
+	Tr.Gui = g
+	Tr.SpeedText = UI.Text(g, "0", 40, { Font = T.FontNumber, AlignX = Enum.TextXAlignment.Right, Position = UDim2.fromOffset(0, 4), Size = UDim2.new(1, -62, 0, 46) })
+	UI.Text(g, "km/h", 14, { Font = T.FontBold, Color = T.SubText, Position = UDim2.new(1, -56, 0, 22), Size = UDim2.fromOffset(50, 20) })
+	UI.Text(g, "Leertaste = Aussteigen", 11, { Color = T.SubText, AlignX = Enum.TextXAlignment.Center, Position = UDim2.new(0, 0, 1, -18), Size = UDim2.new(1, 0, 0, 14) })
+	local function hookChar(ch)
+		local hum = ch:WaitForChild("Humanoid", 10)
+		if not hum then return end
+		hum.Seated:Connect(function(on, seat)
+			if on and seat and seat:IsA("VehicleSeat") then
+				local model = seat:FindFirstAncestorWhichIsA("Model")
+				if model and model:GetAttribute("OwnerId") == player.UserId then
+					task.wait(0.25)
+					start(seat, model)
+				end
+			else
+				stop()
+			end
+		end)
+	end
+	player.CharacterAdded:Connect(hookChar)
+	if player.Character then task.spawn(hookChar, player.Character) end
+end
+
+return Tr
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000003"><Properties><string name="Name">MeshData</string><ProtectedString name="Source"><![CDATA[-- RoadSmooth.MeshData: automatisch erzeugt (Strassen-Meshes aus der geglaetteten Flaeche). Nicht von Hand bearbeiten.
+-- objs: name = Objektname in der OBJ-Datei, cls = A (Asphalt) | K (Kopfstein) | S (Schotter), min/max = Weltbox.
+return {
+	Neustadt = {
+		look = { A = { "Asphalt", "323438" }, K = { "Cobblestone", "7a766c" }, S = { "SmoothPlastic", "aa9e84" } },
+		objs = {
+			{ name = "RS_Neustadt_A_01", cls = "A", tris = 265, min = { -804.0000, -0.5290, -16.0000 }, max = { -512.0000, 0.1000, 0.0000 } },
+			{ name = "RS_Neustadt_A_02", cls = "A", tris = 262, min = { -804.0000, -0.5290, 0.0000 }, max = { -512.0000, 0.1000, 16.0000 } },
+			{ name = "RS_Neustadt_A_03", cls = "A", tris = 888, min = { -512.0000, -0.5290, -252.0000 }, max = { 0.0000, 0.1000, 0.0000 } },
+			{ name = "RS_Neustadt_A_04", cls = "A", tris = 888, min = { -512.0000, -0.5290, 0.0000 }, max = { 0.0000, 0.1000, 252.0000 } },
+			{ name = "RS_Neustadt_A_05", cls = "A", tris = 906, min = { 0.0000, 0.1000, -252.0000 }, max = { 512.0000, 0.1000, 0.0000 } },
+			{ name = "RS_Neustadt_A_06", cls = "A", tris = 3273, min = { 0.0000, -0.6021, 0.0000 }, max = { 512.0000, 16.7537, 512.0000 } },
+			{ name = "RS_Neustadt_A_07", cls = "A", tris = 5608, min = { 50.0454, -0.3196, 512.0000 }, max = { 392.9416, 16.7537, 1024.0000 } },
+			{ name = "RS_Neustadt_A_08", cls = "A", tris = 5606, min = { 73.1148, -1.1287, 1024.0000 }, max = { 512.0000, 15.7470, 1536.0000 } },
+			{ name = "RS_Neustadt_A_09", cls = "A", tris = 3862, min = { 155.3354, 8.1548, 1536.0000 }, max = { 512.0000, 17.6385, 1888.8165 } },
+			{ name = "RS_Neustadt_A_10", cls = "A", tris = 411, min = { 512.0000, -0.5280, -252.0000 }, max = { 614.0000, 0.1000, 0.0000 } },
+			{ name = "RS_Neustadt_A_11", cls = "A", tris = 3457, min = { 512.0000, -0.5640, 0.0000 }, max = { 1024.0000, 16.4881, 512.0000 } },
+			{ name = "RS_Neustadt_A_12", cls = "A", tris = 1127, min = { 584.3929, 0.7045, 512.0000 }, max = { 1024.0000, 17.9281, 908.6001 } },
+			{ name = "RS_Neustadt_A_13", cls = "A", tris = 2072, min = { 512.0000, 2.6769, 1156.8393 }, max = { 1024.0000, 14.6998, 1536.0000 } },
+			{ name = "RS_Neustadt_A_14", cls = "A", tris = 5605, min = { 512.0000, 5.7094, 1536.0000 }, max = { 1024.0000, 20.8947, 1888.4599 } },
+			{ name = "RS_Neustadt_A_15", cls = "A", tris = 218, min = { 1024.0000, 4.6202, 430.4773 }, max = { 1107.6329, 8.7024, 512.0000 } },
+			{ name = "RS_Neustadt_A_16", cls = "A", tris = 4667, min = { 1024.0000, 0.2673, 512.0000 }, max = { 1342.8633, 9.4266, 1024.0000 } },
+			{ name = "RS_Neustadt_A_17", cls = "A", tris = 5345, min = { 1024.0000, -0.7358, 1024.0000 }, max = { 1357.8785, 17.2736, 1536.0000 } },
+			{ name = "RS_Neustadt_A_18", cls = "A", tris = 3732, min = { 1024.0000, 5.0229, 1536.0000 }, max = { 1357.2433, 17.8571, 1875.7616 } },
+			{ name = "RS_Neustadt_K_19", cls = "K", tris = 1816, min = { 279.9564, 4.8870, 519.9687 }, max = { 512.0000, 19.2926, 1024.0000 } },
+			{ name = "RS_Neustadt_K_20", cls = "K", tris = 841, min = { 289.1843, 1.1473, 1024.0000 }, max = { 512.0000, 14.2212, 1496.3055 } },
+			{ name = "RS_Neustadt_K_21", cls = "K", tris = 222, min = { 289.8830, 14.8713, 1619.5615 }, max = { 512.0000, 16.4643, 1642.3308 } },
+			{ name = "RS_Neustadt_K_22", cls = "K", tris = 6296, min = { 512.0000, 2.6554, 516.9574 }, max = { 1015.4527, 19.5684, 1024.0000 } },
+			{ name = "RS_Neustadt_K_23", cls = "K", tris = 2029, min = { 512.0000, 3.5550, 1024.0000 }, max = { 1024.0000, 17.2397, 1500.9582 } },
+			{ name = "RS_Neustadt_K_24", cls = "K", tris = 826, min = { 512.0000, 15.7616, 1622.3275 }, max = { 1024.0000, 20.4212, 1681.5355 } },
+			{ name = "RS_Neustadt_K_25", cls = "K", tris = 522, min = { 1024.0000, 9.6616, 1258.8541 }, max = { 1161.0968, 17.9623, 1536.0000 } },
+			{ name = "RS_Neustadt_K_26", cls = "K", tris = 258, min = { 1024.0000, 15.6064, 1536.0000 }, max = { 1121.9560, 17.5416, 1699.7628 } },
+			{ name = "RS_Neustadt_S_27", cls = "S", tris = 447, min = { 373.9266, 9.3811, 1877.4939 }, max = { 419.4966, 23.1305, 2048.0000 } },
+			{ name = "RS_Neustadt_S_28", cls = "S", tris = 334, min = { 336.6389, 21.4300, 2048.0000 }, max = { 382.1209, 26.7291, 2205.5524 } },
+			{ name = "RS_Neustadt_S_29", cls = "S", tris = 127, min = { 1133.4473, 5.4129, 467.2750 }, max = { 1193.1255, 6.8149, 512.0000 } },
+			{ name = "RS_Neustadt_S_30", cls = "S", tris = 69, min = { 1116.1521, 5.4129, 512.0000 }, max = { 1146.2186, 7.8813, 532.2617 } },
+		},
+	},
+	Portavia = {
+		look = { A = { "Asphalt", "303236" }, K = { "Cobblestone", "827c70" }, S = { "SmoothPlastic", "e6d4a6" } },
+		objs = {
+			{ name = "RS_Portavia_A_01", cls = "A", tris = 25, min = { 7150.0000, -0.5000, -13.0000 }, max = { 7168.0000, 0.1000, 0.0000 } },
+			{ name = "RS_Portavia_A_02", cls = "A", tris = 25, min = { 7150.0000, -0.5000, 0.0000 }, max = { 7168.0000, 0.1000, 13.0000 } },
+			{ name = "RS_Portavia_A_03", cls = "A", tris = 603, min = { 7444.6427, 28.5810, -559.6047 }, max = { 7669.2239, 40.3855, -512.0000 } },
+			{ name = "RS_Portavia_A_04", cls = "A", tris = 6009, min = { 7168.0000, -0.5200, -512.0000 }, max = { 7680.0000, 61.0080, 0.0000 } },
+			{ name = "RS_Portavia_A_05", cls = "A", tris = 1866, min = { 7168.0000, -0.5315, 0.0000 }, max = { 7680.0000, 4.7873, 426.7767 } },
+			{ name = "RS_Portavia_A_06", cls = "A", tris = 576, min = { 7409.0029, -0.5290, 529.0000 }, max = { 7680.0000, 0.0800, 551.0000 } },
+			{ name = "RS_Portavia_A_07", cls = "A", tris = 5776, min = { 7680.0000, 0.1000, -504.2419 }, max = { 8192.0000, 44.9366, 0.0000 } },
+			{ name = "RS_Portavia_A_08", cls = "A", tris = 2487, min = { 7680.0000, -0.5965, 0.0000 }, max = { 8192.0000, 0.5278, 512.0000 } },
+			{ name = "RS_Portavia_A_09", cls = "A", tris = 680, min = { 7680.0000, -0.5400, 512.0000 }, max = { 8192.0000, 0.1000, 776.4197 } },
+			{ name = "RS_Portavia_A_10", cls = "A", tris = 2024, min = { 8192.0000, -0.7320, -244.8492 }, max = { 8434.4619, 23.2614, 0.0000 } },
+			{ name = "RS_Portavia_A_11", cls = "A", tris = 293, min = { 8192.0000, -0.5200, 0.0000 }, max = { 8414.0000, 0.1000, 266.0000 } },
+			{ name = "RS_Portavia_A_12", cls = "A", tris = 678, min = { 8192.0000, -0.5400, 747.0088 }, max = { 8704.0000, 0.1120, 894.0000 } },
+			{ name = "RS_Portavia_A_13", cls = "A", tris = 381, min = { 8704.0000, -0.5583, 869.0000 }, max = { 8771.0000, 0.0901, 1024.0000 } },
+			{ name = "RS_Portavia_A_14", cls = "A", tris = 466, min = { 8749.0000, -0.5299, 1024.0000 }, max = { 8771.0000, 0.0900, 1251.0000 } },
+			{ name = "RS_Portavia_K_15", cls = "K", tris = 2249, min = { 7375.0031, -0.4481, -276.5062 }, max = { 7680.0000, 33.5254, -20.4988 } },
+			{ name = "RS_Portavia_K_16", cls = "K", tris = 690, min = { 7393.8126, -0.4893, 21.0085 }, max = { 7680.0000, 2.9320, 273.5184 } },
+			{ name = "RS_Portavia_K_17", cls = "K", tris = 1246, min = { 7680.0000, -0.4538, -269.2658 }, max = { 7886.4998, 32.1353, -19.8765 } },
+			{ name = "RS_Portavia_K_18", cls = "K", tris = 874, min = { 7680.0000, -0.5103, 14.0000 }, max = { 7833.0000, 0.7193, 512.0000 } },
+			{ name = "RS_Portavia_K_19", cls = "K", tris = 154, min = { 7807.0000, -0.5200, 512.0000 }, max = { 7833.0000, 0.1000, 613.0000 } },
+			{ name = "RS_Portavia_S_20", cls = "S", tris = 802, min = { 7334.9323, 9.2473, -733.2192 }, max = { 7474.0860, 31.4973, -533.7542 } },
+			{ name = "RS_Portavia_S_21", cls = "S", tris = 515, min = { 7981.6221, 1.5842, -736.9607 }, max = { 8166.9179, 24.9749, -512.0000 } },
+			{ name = "RS_Portavia_S_22", cls = "S", tris = 227, min = { 7917.0000, 23.7823, -512.0000 }, max = { 7991.8278, 27.4090, -425.3952 } },
+		},
+	},
+	Metropolis = {
+		look = { A = { "Asphalt", "323438" }, K = { "Cobblestone", "7a766c" }, S = { "SmoothPlastic", "424448" } },
+		objs = {
+			{ name = "RS_Metropolis_A_01", cls = "A", tris = 1834, min = { -8923.8609, 9.2621, -280.1227 }, max = { -8704.0000, 28.8223, 0.0000 } },
+			{ name = "RS_Metropolis_A_02", cls = "A", tris = 4296, min = { -8941.4791, 9.2583, 0.0000 }, max = { -8704.0000, 28.2035, 512.0000 } },
+			{ name = "RS_Metropolis_A_03", cls = "A", tris = 977, min = { -8817.4260, -0.6641, 512.0000 }, max = { -8704.0000, 28.0187, 1024.0000 } },
+			{ name = "RS_Metropolis_A_04", cls = "A", tris = 792, min = { -8812.7540, 0.2063, 1024.0000 }, max = { -8704.0000, 13.0780, 1157.0889 } },
+			{ name = "RS_Metropolis_A_05", cls = "A", tris = 974, min = { -8428.1055, 43.6891, -628.2050 }, max = { -8192.0000, 73.0234, -512.0000 } },
+			{ name = "RS_Metropolis_A_06", cls = "A", tris = 6029, min = { -8704.0000, -0.5200, -512.0000 }, max = { -8192.0000, 62.7814, 0.0000 } },
+			{ name = "RS_Metropolis_A_07", cls = "A", tris = 1394, min = { -8704.0000, -0.5400, 0.0000 }, max = { -8192.0000, 27.1837, 512.0000 } },
+			{ name = "RS_Metropolis_A_08", cls = "A", tris = 3964, min = { -8704.0000, -1.0746, 512.0000 }, max = { -8494.6894, 27.3578, 1024.0000 } },
+			{ name = "RS_Metropolis_A_09", cls = "A", tris = 5756, min = { -8704.0000, 0.1782, 1024.0000 }, max = { -8192.0000, 56.5344, 1463.7191 } },
+			{ name = "RS_Metropolis_A_10", cls = "A", tris = 4756, min = { -8192.0000, 53.2797, -737.1528 }, max = { -7680.0000, 79.7926, -512.0000 } },
+			{ name = "RS_Metropolis_A_11", cls = "A", tris = 1406, min = { -8192.0000, -0.5000, -512.0000 }, max = { -7680.0000, 60.3012, 0.0000 } },
+			{ name = "RS_Metropolis_A_12", cls = "A", tris = 2459, min = { -8192.0000, -0.5400, 0.0000 }, max = { -7680.0000, 1.3226, 512.0000 } },
+			{ name = "RS_Metropolis_A_13", cls = "A", tris = 1089, min = { -8165.1567, -0.5200, 512.0000 }, max = { -7680.0000, 3.7092, 1005.0454 } },
+			{ name = "RS_Metropolis_A_14", cls = "A", tris = 5639, min = { -8192.0000, 16.3648, 1243.9336 }, max = { -7680.0000, 56.2482, 1465.8806 } },
+			{ name = "RS_Metropolis_A_15", cls = "A", tris = 3369, min = { -7680.0000, 23.5624, -705.9612 }, max = { -7168.0000, 85.1571, -512.0000 } },
+			{ name = "RS_Metropolis_A_16", cls = "A", tris = 4711, min = { -7680.0000, -0.5200, -512.0000 }, max = { -7168.0000, 69.0712, 0.0000 } },
+			{ name = "RS_Metropolis_A_17", cls = "A", tris = 1611, min = { -7680.0000, -0.5400, 0.0000 }, max = { -7168.0000, 0.4810, 512.0000 } },
+			{ name = "RS_Metropolis_A_18", cls = "A", tris = 718, min = { -7680.0000, -0.5200, 512.0000 }, max = { -7509.0000, 0.1000, 711.0000 } },
+			{ name = "RS_Metropolis_A_19", cls = "A", tris = 5045, min = { -7680.0000, 3.2202, 1140.9411 }, max = { -7168.0000, 49.0137, 1469.4635 } },
+			{ name = "RS_Metropolis_A_20", cls = "A", tris = 207, min = { -7168.0000, 9.5278, -528.6983 }, max = { -7104.3086, 24.9463, -512.0000 } },
+			{ name = "RS_Metropolis_A_21", cls = "A", tris = 4660, min = { -7168.0000, -1.3312, -512.0000 }, max = { -6883.1879, 49.8343, 0.0000 } },
+			{ name = "RS_Metropolis_A_22", cls = "A", tris = 1784, min = { -7168.0000, -0.5200, 0.0000 }, max = { -6951.6904, 49.5153, 512.0000 } },
+			{ name = "RS_Metropolis_A_23", cls = "A", tris = 2638, min = { -7052.0000, -5.4790, 512.0000 }, max = { -6764.7415, 0.9227, 1024.0000 } },
+			{ name = "RS_Metropolis_A_24", cls = "A", tris = 2683, min = { -7168.0000, -1.9384, 1024.0000 }, max = { -6784.6810, 13.9113, 1252.1734 } },
+			{ name = "RS_Metropolis_K_25", cls = "K", tris = 244, min = { -8784.1766, 24.1982, -42.5245 }, max = { -8704.0000, 29.9081, 0.0000 } },
+			{ name = "RS_Metropolis_K_26", cls = "K", tris = 398, min = { -8827.6265, 14.6108, 0.0000 }, max = { -8754.6688, 28.9287, 57.4721 } },
+			{ name = "RS_Metropolis_K_27", cls = "K", tris = 24, min = { -8710.8866, 0.1746, 892.2714 }, max = { -8704.0000, 0.9533, 913.1137 } },
+			{ name = "RS_Metropolis_K_28", cls = "K", tris = 863, min = { -8704.0000, -0.4252, -416.8540 }, max = { -8192.0000, 35.3394, 0.0000 } },
+			{ name = "RS_Metropolis_K_29", cls = "K", tris = 42, min = { -8482.4606, -0.3218, 0.0000 }, max = { -8417.9070, 2.3884, 9.1596 } },
+			{ name = "RS_Metropolis_K_30", cls = "K", tris = 750, min = { -8704.0000, 0.1663, 834.0691 }, max = { -8192.0000, 2.0129, 1005.7430 } },
+			{ name = "RS_Metropolis_K_31", cls = "K", tris = 1428, min = { -8192.0000, -0.2354, -439.2182 }, max = { -7680.0000, 43.7079, -20.8315 } },
+			{ name = "RS_Metropolis_K_32", cls = "K", tris = 799, min = { -8133.7325, -0.5021, 20.8366 }, max = { -7680.0000, 1.3376, 512.0000 } },
+			{ name = "RS_Metropolis_K_33", cls = "K", tris = 1162, min = { -8192.0000, -0.1582, 512.0000 }, max = { -7680.0000, 3.0377, 1024.0000 } },
+			{ name = "RS_Metropolis_K_34", cls = "K", tris = 1384, min = { -8177.0624, 0.1234, 1024.0000 }, max = { -7680.0000, 36.5013, 1360.0952 } },
+			{ name = "RS_Metropolis_K_35", cls = "K", tris = 1199, min = { -7680.0000, -0.1281, -436.0592 }, max = { -7399.7481, 44.7632, -20.7470 } },
+			{ name = "RS_Metropolis_K_36", cls = "K", tris = 959, min = { -7680.0000, -0.3428, 20.2000 }, max = { -7382.8292, 1.3460, 386.2852 } },
+			{ name = "RS_Metropolis_K_37", cls = "K", tris = 516, min = { -7680.0000, 0.1639, 942.3367 }, max = { -7168.0000, 6.6753, 1024.0000 } },
+			{ name = "RS_Metropolis_K_38", cls = "K", tris = 1116, min = { -7680.0000, 0.1669, 1024.0000 }, max = { -7168.0000, 32.3527, 1364.8990 } },
+			{ name = "RS_Metropolis_K_39", cls = "K", tris = 358, min = { -7168.0000, -0.4538, 773.6142 }, max = { -6980.2103, 0.8881, 988.6950 } },
+			{ name = "RS_Metropolis_K_40", cls = "K", tris = 95, min = { -7168.0000, 0.0091, 1093.3565 }, max = { -7065.8968, 0.9281, 1121.6117 } },
+			{ name = "RS_Metropolis_S_41", cls = "S", tris = 150, min = { -8618.9172, 16.5978, -578.1293 }, max = { -8562.7732, 18.0498, -512.0000 } },
+			{ name = "RS_Metropolis_S_42", cls = "S", tris = 175, min = { -8572.7017, 16.5966, -512.0000 }, max = { -8518.2475, 23.3126, -446.3484 } },
+			{ name = "RS_Metropolis_S_43", cls = "S", tris = 227, min = { -7026.2327, 1.4437, -627.9376 }, max = { -6934.8451, 2.5000, -512.0000 } },
+			{ name = "RS_Metropolis_S_44", cls = "S", tris = 81, min = { -7049.5016, 1.9000, -512.0000 }, max = { -7016.3627, 2.6876, -475.0471 } },
+		},
+	},
+}
+]]></ProtectedString></Properties></Item></Item></roblox>
