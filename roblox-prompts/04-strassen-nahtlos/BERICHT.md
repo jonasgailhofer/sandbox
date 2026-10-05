@@ -139,7 +139,17 @@ nur noch 1,0. Ganz verschwinden kann das nur, wenn die Kuppe in der Welt flacher
   - Das Audit zählte Sprünge dreifach und wertete Rampen als Aufsetzen.
   - Lücken wurden zwischen verschiedenen Ebenen geschlossen.
   - Hintergrund-Jobs verloren den Traceback.
-- **Zweite Prüfrunde:** Sie lief über alle Änderungen. Ergebnis folgt.
+- **Zweite Prüfrunde:** Sie lief über alle Änderungen und fand keinen schweren Fehler.
+  - Sie bestätigt die Geometrie der Mindesthöhe, die Vorzeichen der Vorausschau, die Roblox-API-Aufrufe und die Rechenkern-Tests.
+  - Drei kleinere Fehler hat sie gefunden, alle sind behoben:
+    - Ein Fahrwerk-Update hätte das Original-Backup ersetzt.
+    - Die Vorausschau sah Fahrbahnteile ohne Haut nicht.
+    - `RS.Reset` hat den alten Job nicht beendet.
+  - **Bekannt und bewusst offen (gering):**
+    - Am Fahrbahnrand glättet die Fläche das Quergefälle etwas.
+    - Das Audit bildet die neue Filterlogik nicht nach; dafür gibt es die echte Testfahrt.
+    - `CornerWedge`-Teile werden wie Blöcke behandelt.
+    - Einige Durchläufe über das Raster geben Studio keine Pause.
 
 ## Grenzen (ehrlich)
 - **Testlauf:** Die Werkzeuge konnten nicht in Roblox selbst laufen. Der Rechenkern ist getestet und der Code gegen die

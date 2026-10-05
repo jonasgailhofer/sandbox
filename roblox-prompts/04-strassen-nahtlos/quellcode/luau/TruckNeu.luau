@@ -4,7 +4,7 @@
 --     Kollisionsgruppe "TruckRay" (sieht die glatte Fahrhaut statt der alten Fahrbahn-Abschnitte).
 --   * Hoehe wird mit einem Alpha-Beta-Filter geglaettet: folgt Steigungen ohne Verzug, kleine Kanten werden weich.
 --   * Vorausschau-Strahlen an der Stossstange heben den LKW rechtzeitig an, statt gegen Kanten zu fahren
---     (nur flache, befahrbare Stufen bis MAX_LIFT; Waende, Fahrzeuge, Gegenstaende bleiben Hindernisse).
+--     (nur flache Fahrbahn-/Gelaende-Stufen, stetig bis MAX_LIFT; Waende, Fahrzeuge, Gegenstaende bleiben Hindernisse).
 --   * Mindesthoehe rechnet mit dem geneigten Kasten (Hang, Kuppe), nicht mit einem waagrechten.
 --   * Neigung (Up-Vektor) wird weich nachgefuehrt.
 --   * Fehlt die Fahrhaut an einer Stelle (Streaming, noch nicht gebaut), sehen die Strahlen die alte Fahrbahn.
@@ -28,6 +28,12 @@ local UP_RATE = 10 -- Nachfuehrung der Neigung (1/s)
 local LOOKAHEAD = 0.18 -- Sekunden Vorausschau fuer die Stossstangen-Strahlen
 local MAX_LIFT = 1.0 -- Vorausschau/Mitte: hoechstens so viel zusaetzliches Anheben (hoehere Stufen = Hindernis, Kasten stoesst an)
 local RAMP = 0.25 -- Vorausschau: Steigung, die der Kasten durch Kippen selbst schafft (wird ab der Stossstange abgezogen)
+-- Vorausschau zaehlt nur Fahrbahn: Fahrhaut, Gelaende und diese Fahrbahnteile (alles andere = Hindernis)
+local ROADNAMES = {
+	Road = true, RoadFill = true, RoadRamp = true, SlitFill = true, RoadBevel = true, Asphalt = true, Joint = true,
+	JointSquare = true, Lane = true, LaneJoint = true, LaneLink = true, TurnCircle = true, EndCap = true, Deck = true,
+	Track = true, Yard = true,
+}
 local FLOAT = 0.6 -- gefilterte Hoehe hoechstens so weit ueber der gemessenen (kein Nachschweben nach Kuppen)
 
 local function groupExists(name)
@@ -109,12 +115,7 @@ local function start(seat, model)
 	local baseParams = RaycastParams.new()
 	baseParams.FilterType = Enum.RaycastFilterType.Exclude
 	baseParams.RespectCanCollide = true
-	-- Vorausschau: nur Fahrhaut + Gelaende (keine Fahrzeuge, Mauern, Gegenstaende)
-	local laParams = RaycastParams.new()
-	laParams.FilterType = Enum.RaycastFilterType.Include
-	laParams.RespectCanCollide = true
-	if useSkin then laParams.CollisionGroup = "TruckRay" end
-	local laInclude = false
+	local skin = nil -- workspace.World.FahrHaut
 	local function refreshFilter()
 		local list = { model }
 		for _, p in ipairs(Players:GetPlayers()) do if p.Character then table.insert(list, p.Character) end end
@@ -125,9 +126,7 @@ local function start(seat, model)
 		if veh then table.insert(list, veh) end
 		params.FilterDescendantsInstances = list
 		baseParams.FilterDescendantsInstances = list
-		local skin = world and world:FindFirstChild("FahrHaut")
-		laInclude = skin ~= nil
-		laParams.FilterDescendantsInstances = skin and { skin, workspace.Terrain } or {}
+		skin = world and world:FindFirstChild("FahrHaut")
 	end
 	refreshFilter()
 	local gui = Tr.Gui
@@ -154,9 +153,12 @@ local function start(seat, model)
 	-- (base = Hoehe der Bodenebene unter den Raedern, bis zu dieser Stelle verlaengert, plus Rampen-Toleranz)
 	local function castAhead(wp, base)
 		local top = base + (ride - halfH) + MAX_LIFT + 1.5
-		local o = Vector3.new(wp.X, top, wp.Z)
-		if laInclude then return workspace:Raycast(o, DOWN, laParams) end
-		return workspace:Raycast(o, DOWN, params)
+		local h = workspace:Raycast(Vector3.new(wp.X, top, wp.Z), DOWN, params)
+		if not h then return nil end
+		local inst = h.Instance
+		-- nur Fahrbahn zaehlt: Haut, Gelaende, Fahrbahnteile ohne Haut (Unterfuehrung, Teilabdeckung)
+		if inst == workspace.Terrain or ROADNAMES[inst.Name] or (skin and inst:IsDescendantOf(skin)) then return h end
+		return nil
 	end
 	active.Conn = RunService.Heartbeat:Connect(function(dt)
 		if not seat.Parent or seat.Occupant == nil or not root.Parent then stop() return end

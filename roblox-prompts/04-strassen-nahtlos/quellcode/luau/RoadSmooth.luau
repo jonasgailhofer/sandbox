@@ -408,6 +408,10 @@ local function setSource(sc, text)
 	return sc.Source == text
 end
 
+local function isRoadSmoothTruck(source)
+	return string.find(source, "[RoadSmooth] Fahrwerk", 1, true) ~= nil
+end
+
 function RS.InstallTruck()
 	local tr = truckScript()
 	assert(tr and tr:IsA("ModuleScript"), "StarterPlayerScripts.Client.Truck nicht gefunden")
@@ -418,15 +422,18 @@ function RS.InstallTruck()
 	end
 	local bk = folder(ServerStorage, "ScriptBackups")
 	local old = bk:FindFirstChild("Truck_vorRoadSmooth")
-	if old and old.Source ~= tr.Source then
-		-- Truck wurde seit dem letzten Backup geaendert: altes Backup behalten (mit Datum), aktuellen Stand sichern
-		old.Name = "Truck_vorRoadSmooth_" .. os.date("%Y%m%d_%H%M%S")
-		old = nil
-	end
-	if not old then
-		local c = tr:Clone()
-		c.Name = "Truck_vorRoadSmooth"
-		c.Parent = bk
+	-- Backup nur vom Fahrwerk OHNE RoadSmooth (bei einem Update von v2 auf eine neuere v2 bleibt das Original-Backup)
+	if not isRoadSmoothTruck(tr.Source) then
+		if old and old.Source ~= tr.Source then
+			-- Truck wurde seit dem letzten Backup geaendert: altes Backup behalten (mit Datum), aktuellen Stand sichern
+			old.Name = "Truck_vorRoadSmooth_" .. os.date("%Y%m%d_%H%M%S")
+			old = nil
+		end
+		if not old then
+			local c = tr:Clone()
+			c.Name = "Truck_vorRoadSmooth"
+			c.Parent = bk
+		end
 	end
 	assert(setSource(tr, src.Source), "Quelltext liess sich nicht setzen - Truck-Skript-Tab schliessen und nochmal")
 	RS.Groups()
@@ -438,9 +445,8 @@ function RS.UninstallTruck(force)
 	local bk = ServerStorage:FindFirstChild("ScriptBackups")
 	local old = bk and bk:FindFirstChild("Truck_vorRoadSmooth")
 	assert(tr and old, "Backup oder Truck-Modul fehlt")
-	local src = script:FindFirstChild("TruckNeu")
-	assert(force or (src and tr.Source == src.Source),
-		"Truck-Modul wurde nach der Installation geaendert - RS.UninstallTruck(true) setzt trotzdem das Backup zurueck")
+	assert(force or isRoadSmoothTruck(tr.Source),
+		"Truck-Modul ist kein RoadSmooth-Fahrwerk (spaeter geaendert?) - RS.UninstallTruck(true) setzt trotzdem das Backup zurueck")
 	assert(setSource(tr, old.Source), "Quelltext liess sich nicht setzen - Truck-Skript-Tab schliessen und nochmal")
 	return "altes Fahrwerk wiederhergestellt"
 end
@@ -1189,6 +1195,7 @@ end
 ----------------------------------------------------------------------------------------------- Hintergrund-Jobs
 -- RS.Run("Build", "Neustadt") / RS.Run("Audit", "Neustadt", {Mode="alt"}) ... dann RS.Status() abfragen
 local generation = 0
+local jobThread = nil
 function RS.Run(fname, ...)
 	assert(type(RS[fname]) == "function", "unbekannte Funktion " .. tostring(fname))
 	assert(status.Done, "es laeuft schon: " .. status.Job .. " (haengt er? RS.Reset())")
@@ -1199,7 +1206,7 @@ function RS.Run(fname, ...)
 	status.Done, status.Error, status.Result = false, nil, nil
 	status.Step, status.Progress = "", 0
 	status.Started = os.clock()
-	task.spawn(function()
+	jobThread = task.spawn(function()
 		local ok, res = xpcall(RS[fname], debug.traceback, table.unpack(args, 1, args.n))
 		if gen ~= generation then return end -- inzwischen per RS.Reset() abgeloest
 		status.Done = true
@@ -1208,9 +1215,15 @@ function RS.Run(fname, ...)
 	return "gestartet: " .. status.Job .. " - Fortschritt mit RS.Status()"
 end
 
--- Notausgang, falls ein Job haengt (z. B. Play-Modus beendet): Status freigeben. Der alte Job wird ignoriert.
+-- Notausgang, falls ein Job haengt (z. B. Play-Modus beendet): alten Job abbrechen und Status freigeben.
+-- Achtung: ein abgebrochener Build/CarveTerrain ist halb fertig -> danach Build bzw. RestoreTerrain erneut ausfuehren.
 function RS.Reset()
 	generation += 1
+	-- alten Job wirklich beenden (sonst laeuft z. B. ein langsamer Build parallel zum naechsten weiter)
+	if jobThread then
+		pcall(task.cancel, jobThread)
+		jobThread = nil
+	end
 	local was = status.Job
 	status.Done, status.Error, status.Result = true, nil, "zurueckgesetzt (vorher: " .. was .. ")"
 	return "Status zurueckgesetzt (vorher: " .. was .. ")"

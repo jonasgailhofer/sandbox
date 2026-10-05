@@ -104,7 +104,8 @@ Hänger oder Hindernisse, wenn man mit dem LKW darüberfährt.
 Lange Funktionen startest du mit `RS.Run(...)` im Hintergrund und fragst alle 20–30 s `RS.Status()` ab.
 So läuft dir kein MCP-Aufruf in einen Timeout.
 - Fehler kommen mit vollständigem Traceback zurück.
-- Hängt der Status, zum Beispiel weil der Play-Modus beendet wurde: `RS.Reset()`.
+- Hängt der Status, zum Beispiel weil der Play-Modus beendet wurde: `RS.Reset()`. Das bricht den alten Job ab.
+  War es ein `Build` oder `CarveTerrain`, ist er halb fertig. Dann `Build` neu laufen lassen bzw. `RS.RestoreTerrain(stadt)`.
 
 Wichtige Hinweise:
 - **Vor `RS.InstallTruck()`** den Skript-Tab von `StarterPlayerScripts.Client.Truck` schließen, falls er offen ist.
